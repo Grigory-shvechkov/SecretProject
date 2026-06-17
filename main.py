@@ -22,7 +22,7 @@ def get_position():
     """Endpoint to get the current position."""
     return {"position": [p.value for p in position]}
 
-@app.get("/newPos")
+@app.post("/newPos")
 def new_position(x: int, y: int, z: int):
     """Endpoint to set a new position."""
     global position
