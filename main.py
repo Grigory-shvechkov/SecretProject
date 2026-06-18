@@ -1,6 +1,10 @@
 """Super Secret project"""
-from fastapi import FastAPI
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
+
+from fastapi import FastAPI
+from pydantic import BaseModel
+
 
 @dataclass
 class Position:
@@ -9,26 +13,43 @@ class Position:
     y: float = 0
     z: float = 0
 
-position = Position()
 
-app = FastAPI()
+class PositionPayload(BaseModel):
+    """JSON body schema for setting a new position."""
+    x: float
+    y: float
+    z: float
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    app.state.position = Position()
+    yield
+
+
+app = FastAPI(lifespan=lifespan)
+
 
 @app.get("/")
 def root():
     """Root endpoint returning the status of the API."""
     return {"Status": "OK"}
 
+
 @app.get("/position")
 def get_position():
     """Endpoint to get the current position."""
-    return {"position": {"x": position.x, "y": position.y, "z": position.z}}
+    p = app.state.position
+    return {"position": {"x": p.x, "y": p.y, "z": p.z}}
+
 
 @app.post("/newPos")
-def new_position(x: int, y: int, z: int):
+def new_position(payload: PositionPayload):
     """Endpoint to set a new position."""
-    global position
-    position = Position(x, y, z)
-    return {"position": {"x": position.x, "y": position.y, "z": position.z}}
+    app.state.position = Position(payload.x, payload.y, payload.z)
+    p = app.state.position
+    return {"position": {"x": p.x, "y": p.y, "z": p.z}}
+
 
 @app.post("/feed")
 def feed():
