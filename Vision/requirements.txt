@@ -1,3 +1,7 @@
-opencv-python
+# opencv-python is deliberately NOT listed here for pip to install.
+# On this Pi (Python 3.9), pip's source build fails patching OpenEXR --
+# there's no matching prebuilt wheel for this platform/Python combo.
+# Install it via apt instead, which ships a precompiled binary:
+#     sudo apt install -y python3-opencv
 numpy
 requests
