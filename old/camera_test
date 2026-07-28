@@ -1,0 +1,297 @@
+"""
+OV9732 Triple Camera Test
+Tests: digital zoom, face detection, license plate detection (via edge detection)
+
+Requirements:
+    pip install opencv-python opencv-contrib-python numpy
+
+Controls (per window):
+    Q          - quit all
+    1 / 2 / 3  - switch active camera
+    +  / -     - zoom in / out  (digital)
+    R          - reset zoom
+    F          - toggle face detection
+    L          - toggle license plate / edge detection
+    S          - save snapshot from all cameras
+    SPACE      - cycle display mode (single / side-by-side / all-3)
+"""
+
+import cv2
+import numpy as np
+import threading
+import time
+import os
+from datetime import datetime
+
+# ─── Config ───────────────────────────────────────────────────────────────────
+MAX_CAMERAS   = 6       # how many indices to scan
+FRAME_W       = 1280
+FRAME_H       = 720
+DISPLAY_W     = 640     # per-camera display width
+DISPLAY_H     = 360     # per-camera display height
+ZOOM_STEP     = 0.1
+ZOOM_MIN      = 1.0
+ZOOM_MAX      = 5.0
+SNAPSHOT_DIR  = "snapshots"
+
+# ─── Haar cascades (built into OpenCV) ────────────────────────────────────────
+FACE_CASCADE = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
+PLATE_CASCADE = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_russian_plate_number.xml")
+
+os.makedirs(SNAPSHOT_DIR, exist_ok=True)
+
+
+# ─── Per-camera state ─────────────────────────────────────────────────────────
+class CameraState:
+    def __init__(self, index):
+        self.index        = index
+        self.zoom         = 1.0
+        self.face_detect  = False
+        self.plate_detect = False
+        self.frame        = None
+        self.lock         = threading.Lock()
+        self.running      = False
+        self.cap          = None
+        self.fps          = 0
+        self._fps_count   = 0
+        self._fps_time    = time.time()
+
+    def update_fps(self):
+        self._fps_count += 1
+        now = time.time()
+        if now - self._fps_time >= 1.0:
+            self.fps = self._fps_count
+            self._fps_count = 0
+            self._fps_time = now
+
+
+def capture_thread(cam: CameraState):
+    cam.cap = cv2.VideoCapture(cam.index)
+    cam.cap.set(cv2.CAP_PROP_FRAME_WIDTH,  FRAME_W)
+    cam.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_H)
+    cam.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+    cam.running = True
+
+    while cam.running:
+        ret, frame = cam.cap.read()
+        if not ret:
+            time.sleep(0.01)
+            continue
+        with cam.lock:
+            cam.frame = frame
+        cam.update_fps()
+
+    cam.cap.release()
+
+
+def apply_digital_zoom(frame, zoom):
+    """Crop centre and resize back — simulates zoom."""
+    if zoom <= 1.0:
+        return frame
+    h, w = frame.shape[:2]
+    new_w = int(w / zoom)
+    new_h = int(h / zoom)
+    x1 = (w - new_w) // 2
+    y1 = (h - new_h) // 2
+    cropped = frame[y1:y1+new_h, x1:x1+new_w]
+    return cv2.resize(cropped, (w, h), interpolation=cv2.INTER_LINEAR)
+
+
+def detect_faces(frame):
+    gray   = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    faces  = FACE_CASCADE.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(40, 40))
+    count  = 0
+    for (x, y, w, h) in faces:
+        cv2.rectangle(frame, (x, y), (x+w, y+h), (0, 255, 0), 2)
+        cv2.putText(frame, "Face", (x, y - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+        count += 1
+    return frame, count
+
+
+def detect_plates(frame):
+    """Haar cascade + edge highlight for license plates."""
+    gray   = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    plates = PLATE_CASCADE.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=4, minSize=(60, 20))
+    count  = 0
+    for (x, y, w, h) in plates:
+        cv2.rectangle(frame, (x, y), (x+w, y+h), (0, 128, 255), 2)
+        cv2.putText(frame, "Plate?", (x, y - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 128, 255), 2)
+        count += 1
+    return frame, count
+
+
+def render_frame(cam: CameraState, active: bool):
+    """Return a display-sized annotated frame, or a placeholder."""
+    with cam.lock:
+        raw = cam.frame.copy() if cam.frame is not None else None
+
+    if raw is None:
+        placeholder = np.zeros((DISPLAY_H, DISPLAY_W, 3), dtype=np.uint8)
+        cv2.putText(placeholder, f"Camera {cam.index} — no signal",
+                    (20, DISPLAY_H//2), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (80, 80, 80), 1)
+        return placeholder
+
+    # Digital zoom
+    frame = apply_digital_zoom(raw, cam.zoom)
+
+    # Detections
+    face_count  = 0
+    plate_count = 0
+    if cam.face_detect:
+        frame, face_count  = detect_faces(frame)
+    if cam.plate_detect:
+        frame, plate_count = detect_plates(frame)
+
+    # Resize for display
+    frame = cv2.resize(frame, (DISPLAY_W, DISPLAY_H))
+
+    # HUD
+    border_col = (0, 200, 255) if active else (60, 60, 60)
+    cv2.rectangle(frame, (0, 0), (DISPLAY_W-1, DISPLAY_H-1), border_col, 2)
+
+    hud = [
+        f"Cam {cam.index}  {cam.fps}fps",
+        f"Zoom {cam.zoom:.1f}x",
+        f"Faces: {face_count}" if cam.face_detect  else "Face det: OFF",
+        f"Plates: {plate_count}" if cam.plate_detect else "Plate det: OFF",
+    ]
+    for i, line in enumerate(hud):
+        cv2.putText(frame, line, (8, 20 + i*20),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.52, (255, 255, 255), 1, cv2.LINE_AA)
+
+    return frame
+
+
+def save_snapshots(cameras):
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    for cam in cameras:
+        with cam.lock:
+            if cam.frame is not None:
+                path = os.path.join(SNAPSHOT_DIR, f"cam{cam.index}_{ts}.jpg")
+                cv2.imwrite(path, cam.frame)
+                print(f"  Saved {path}")
+
+
+# ─── Main ─────────────────────────────────────────────────────────────────────
+def main():
+    # Scan for cameras
+    print("Scanning for cameras (this may take a few seconds)...")
+    indices = []
+    for i in range(MAX_CAMERAS):
+        cap = cv2.VideoCapture(i)
+        if cap.isOpened():
+            ret, _ = cap.read()
+            if ret:
+                indices.append(i)
+                print(f"  Found camera {i}")
+        cap.release()
+
+    if not indices:
+        print("No cameras found. Check USB connections.")
+        return
+
+    print(f"\n{len(indices)} camera(s) found: {indices}")
+    print("\nControls:")
+    print("  1/2/3    — select active camera")
+    print("  + / -    — zoom in / out")
+    print("  R        — reset zoom")
+    print("  F        — toggle face detection")
+    print("  L        — toggle license plate detection")
+    print("  S        — save snapshots")
+    print("  SPACE    — cycle view (single / side-by-side / grid)")
+    print("  Q        — quit\n")
+
+    # Start capture threads
+    cameras = [CameraState(i) for i in indices]
+    threads = []
+    for cam in cameras:
+        t = threading.Thread(target=capture_thread, args=(cam,), daemon=True)
+        t.start()
+        threads.append(t)
+
+    time.sleep(0.8)  # let cameras warm up
+
+    active_idx  = 0
+    view_mode   = 0   # 0=single  1=side-by-side  2=grid
+    VIEW_LABELS = ["Single", "Side-by-side", "Grid"]
+
+    while True:
+        active_cam = cameras[active_idx]
+
+        frames = [render_frame(cam, cam.index == active_cam.index) for cam in cameras]
+
+        # Build display based on mode
+        if view_mode == 0 or len(cameras) == 1:
+            display = frames[active_idx]
+
+        elif view_mode == 1:
+            # Side by side (first 2)
+            display = np.hstack(frames[:2]) if len(frames) >= 2 else frames[0]
+
+        else:
+            # Grid: up to 3 cameras, pad to even row
+            if len(frames) == 1:
+                display = frames[0]
+            elif len(frames) == 2:
+                display = np.hstack(frames)
+            else:
+                # 3 cameras: top row = cam0+cam1, bottom = cam2 centred
+                top = np.hstack(frames[:2])
+                pad = np.zeros((DISPLAY_H, DISPLAY_W, 3), dtype=np.uint8)
+                bot = np.hstack([frames[2], pad])
+                display = np.vstack([top, bot])
+
+        # View mode label
+        cv2.putText(display, f"View: {VIEW_LABELS[view_mode]}  [SPACE to cycle]",
+                    (8, display.shape[0] - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (180, 180, 180), 1)
+
+        cv2.imshow("OV9732 Camera Test", display)
+
+        key = cv2.waitKey(1) & 0xFF
+
+        if key == ord('q'):
+            break
+
+        elif key == ord(' '):
+            view_mode = (view_mode + 1) % 3
+
+        elif key in (ord('1'), ord('2'), ord('3')):
+            idx = key - ord('1')
+            if idx < len(cameras):
+                active_idx = idx
+                print(f"Active camera: {cameras[active_idx].index}")
+
+        elif key in (ord('+'), ord('=')):
+            active_cam.zoom = min(ZOOM_MAX, round(active_cam.zoom + ZOOM_STEP, 1))
+            print(f"Cam {active_cam.index} zoom: {active_cam.zoom:.1f}x")
+
+        elif key == ord('-'):
+            active_cam.zoom = max(ZOOM_MIN, round(active_cam.zoom - ZOOM_STEP, 1))
+            print(f"Cam {active_cam.index} zoom: {active_cam.zoom:.1f}x")
+
+        elif key == ord('r'):
+            active_cam.zoom = 1.0
+            print(f"Cam {active_cam.index} zoom reset")
+
+        elif key == ord('f'):
+            active_cam.face_detect = not active_cam.face_detect
+            print(f"Cam {active_cam.index} face detection: {'ON' if active_cam.face_detect else 'OFF'}")
+
+        elif key == ord('l'):
+            active_cam.plate_detect = not active_cam.plate_detect
+            print(f"Cam {active_cam.index} plate detection: {'ON' if active_cam.plate_detect else 'OFF'}")
+
+        elif key == ord('s'):
+            print("Saving snapshots...")
+            save_snapshots(cameras)
+
+    # Cleanup
+    for cam in cameras:
+        cam.running = False
+    cv2.destroyAllWindows()
+    print("Done.")
+
+
+if __name__ == "__main__":
+    main()
