@@ -4,11 +4,15 @@ debug_view.py -- live debug viewer for the fish tank vision pipeline.
 Shows both cameras side by side, live, with two things drawn automatically
 every frame -- no manual calibration step:
 
-  1. The "focus rectangle" -- the tank's visible bounds, computed each
-     frame from colored corner markers (stickers/tape/paper) you place at
-     the tank's corners and leave there permanently. Works with 2
-     (diagonal) or all 4 markers -- the box is just the min/max of
-     whichever ones are currently visible.
+  1. The "focus rectangle" -- the tank's visible bounds, computed from
+     colored corner markers (stickers/tape/paper) you place at the tank's
+     corners and leave there permanently. With EXPECTED_MARKERS (4) points
+     found, this is a properly ROTATED rectangle (cv2.minAreaRect) so a
+     camera that isn't perfectly level/square-on to the tank still gets
+     an accurate box, not a plain axis-aligned one. The box only updates
+     when the FULL expected set is found in one check -- a partial set
+     (one sticker occluded/dropped out) keeps the last good box instead
+     of shrinking to fit whatever's currently visible.
   2. The tracked object (red ball / fish), circled, if currently visible.
 
 This is a development tool, not part of the production loop (run.py) --
@@ -47,6 +51,14 @@ SIDE_CAMERA_INDEX = 2
 MARKER_LOWER = (135, 60, 40)
 MARKER_UPPER = (175, 255, 255)
 
+# How many corner stickers you actually placed (2 diagonal, or 4, one per
+# corner). ColorMarkerDetector returns every blob above min_area sorted
+# largest-first -- capping to this count keeps a stray false-positive
+# blob (a reflection, background clutter) from ever joining the min/max
+# box calculation, since it'd have to out-rank a real sticker in area to
+# get in.
+EXPECTED_MARKERS = 4
+
 DISPLAY_W = 640
 DISPLAY_H = 480
 
@@ -57,7 +69,35 @@ DISPLAY_H = 480
 MARKER_RECHECK_EVERY_N_FRAMES = 5
 
 
-def _annotate(frame, object_detector, marker_detector, last_bounds, run_marker_detection):
+def _rect_from_markers(centers):
+    """Turn marker centers into rectangle corners.
+
+    With 3+ points: the minimum-area ROTATED rectangle (cv2.minAreaRect)
+    that fits them -- this is what actually accounts for a camera that
+    isn't perfectly level/square-on to the tank glass. A plain axis-
+    aligned min/max box can't represent a tilted view at all.
+
+    With exactly 2 points: falls back to an axis-aligned box, since two
+    opposite corners alone don't constrain a rotation angle.
+
+    Returns a list of 4 (x, y) int points, or None if fewer than 2.
+    """
+    if len(centers) < 2:
+        return None
+
+    if len(centers) == 2:
+        (x1, y1), (x2, y2) = centers
+        left, right = sorted((x1, x2))
+        top, bottom = sorted((y1, y2))
+        return [(left, top), (right, top), (right, bottom), (left, bottom)]
+
+    points = np.array(centers, dtype=np.float32)
+    rect = cv2.minAreaRect(points)
+    box = cv2.boxPoints(rect)
+    return [(int(x), int(y)) for x, y in box]
+
+
+def _annotate(frame, object_detector, marker_detector, last_box, run_marker_detection):
     """Detect on the RAW frame first, then draw. Order matters here:
     RedBallDetector.draw() paints a blue center-dot on the object, which
     is the same color family as the default marker color -- detecting
@@ -70,13 +110,13 @@ def _annotate(frame, object_detector, marker_detector, last_bounds, run_marker_d
 
     Parameters
     ----------
-    last_bounds : the last computed marker bounds, reused when
-        run_marker_detection is False (skips ColorMarkerDetector work
-        entirely on throttled frames).
+    last_box : the last computed marker rectangle (4 points), reused
+        whenever this check doesn't find the full expected marker set --
+        see below for why that matters.
     run_marker_detection : whether to actually re-run marker detection
         this frame, or just keep drawing the last known rectangle.
 
-    Returns (annotated_bgr, marker_mask_bgr, bounds_to_reuse_next_call).
+    Returns (annotated_bgr, marker_mask_bgr, box_to_reuse_next_call, hsv_for_sampling).
     """
     blurred = cv2.GaussianBlur(frame, (5, 5), 0)
     hsv = cv2.cvtColor(blurred, cv2.COLOR_BGR2HSV)
@@ -86,30 +126,70 @@ def _annotate(frame, object_detector, marker_detector, last_bounds, run_marker_d
 
     if run_marker_detection:
         marker_centers, marker_mask = marker_detector.detect(frame, hsv=hsv)
-        # Fall back to the last known good box on a transient miss --
-        # only overwrite it when this check actually finds 2+ markers.
-        # Nulling it out here would flash the box off for one bad frame
-        # even though nothing physically moved.
-        bounds = last_bounds
-        if len(marker_centers) >= 2:
-            xs = [x for x, _ in marker_centers]
-            ys = [y for _, y in marker_centers]
-            bounds = (min(xs), max(xs), min(ys), max(ys))
+        # Cap to the expected count (largest-first) so a stray
+        # false-positive blob elsewhere in frame can never join the box
+        # calculation -- it would have to out-rank a real sticker in
+        # area to get in.
+        marker_centers = marker_centers[:EXPECTED_MARKERS]
+
+        # Only trust a FULL set. Accepting a partial set (e.g. 2 out of
+        # 4 because one sticker briefly dropped below threshold) would
+        # replace a good box with one sized to whatever's currently
+        # visible -- that's what was causing the size to cycle between
+        # too-big/too-small/half-size on every recheck.
+        box = last_box
+        if len(marker_centers) >= EXPECTED_MARKERS:
+            box = _rect_from_markers(marker_centers)
         frame = marker_detector.draw(frame, marker_centers)
     else:
         marker_mask = np.zeros(frame.shape[:2], dtype=np.uint8)
-        bounds = last_bounds
+        box = last_box
 
-    if bounds is not None:
-        left, right, top, bottom = bounds
-        cv2.rectangle(frame, (left, top), (right, bottom), (0, 255, 0), 2)
+    if box is not None:
+        pts = np.array(box, dtype=np.int32)
+        cv2.polylines(frame, [pts], isClosed=True, color=(0, 255, 0), thickness=2)
     else:
-        cv2.putText(frame, "0/2+ corner markers visible",
+        cv2.putText(frame, f"waiting for all {EXPECTED_MARKERS} corner markers",
                     (10, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
 
     frame = cv2.resize(frame, (DISPLAY_W, DISPLAY_H))
     marker_mask_bgr = cv2.cvtColor(cv2.resize(marker_mask, (DISPLAY_W, DISPLAY_H)), cv2.COLOR_GRAY2BGR)
-    return frame, marker_mask_bgr, bounds
+    # Resized to match the displayed frame, so a click's (x, y) in the
+    # window maps directly onto this array with no extra scaling math.
+    hsv_display = cv2.resize(hsv, (DISPLAY_W, DISPLAY_H))
+    return frame, marker_mask_bgr, box, hsv_display
+
+
+WINDOW_NAME = "Fish Tank Vision Debug"
+
+
+def _make_mouse_callback(sampled_hsv):
+    """Returns an OpenCV mouse callback that prints the HSV value of
+    whatever pixel you click. Use this to read the color your camera
+    ACTUALLY captures for a marker or for background clutter -- printer
+    ink, tank lighting, and webcam color reproduction all shift a color
+    from what a swatch/screen suggests, so this beats guessing at ranges.
+
+    sampled_hsv is a dict {"front": hsv_array_or_None, "side": ...} kept
+    up to date by the main loop -- the callback just reads whatever's
+    currently in it when a click happens.
+    """
+    def on_mouse(event, x, y, flags, param):
+        if event != cv2.EVENT_LBUTTONDOWN:
+            return
+
+        if x < DISPLAY_W:
+            label, hsv_frame, px, py = "FRONT", sampled_hsv.get("front"), x, y
+        else:
+            label, hsv_frame, px, py = "SIDE", sampled_hsv.get("side"), x - DISPLAY_W, y
+
+        if hsv_frame is None:
+            return
+
+        h, s, v = hsv_frame[py, px]
+        print(f"{label} click at ({px},{py}) -> HSV ({h}, {s}, {v})")
+
+    return on_mouse
 
 
 def main():
@@ -120,10 +200,14 @@ def main():
 
     show_mask = False
     frame_count = 0
-    front_bounds = None
-    side_bounds = None
+    front_box = None
+    side_box = None
 
-    print("Debug viewer running. Q to quit, M to toggle marker-mask view.")
+    sampled_hsv = {"front": None, "side": None}
+    cv2.namedWindow(WINDOW_NAME)
+    cv2.setMouseCallback(WINDOW_NAME, _make_mouse_callback(sampled_hsv))
+
+    print("Debug viewer running. Q to quit, M to toggle marker-mask view, click to print a pixel's HSV.")
     with Camera(FRONT_CAMERA_INDEX) as front_cam, Camera(SIDE_CAMERA_INDEX) as side_cam:
         while True:
             front_frame = front_cam.read()
@@ -134,10 +218,13 @@ def main():
 
             run_markers = (frame_count % MARKER_RECHECK_EVERY_N_FRAMES == 0)
 
-            front_view, front_mask, front_bounds = _annotate(
-                front_frame, object_detector_front, marker_detector_front, front_bounds, run_markers)
-            side_view, side_mask, side_bounds = _annotate(
-                side_frame, object_detector_side, marker_detector_side, side_bounds, run_markers)
+            front_view, front_mask, front_box, front_hsv = _annotate(
+                front_frame, object_detector_front, marker_detector_front, front_box, run_markers)
+            side_view, side_mask, side_box, side_hsv = _annotate(
+                side_frame, object_detector_side, marker_detector_side, side_box, run_markers)
+
+            sampled_hsv["front"] = front_hsv
+            sampled_hsv["side"] = side_hsv
 
             frame_count += 1
 
@@ -146,11 +233,11 @@ def main():
 
             display = np.hstack([front_mask, side_mask]) if show_mask else np.hstack([front_view, side_view])
 
-            cv2.putText(display, "Q: quit   M: toggle marker-mask",
+            cv2.putText(display, "Q: quit   M: toggle marker-mask   click: sample HSV",
                         (10, display.shape[0] - 10),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (180, 180, 180), 1)
 
-            cv2.imshow("Fish Tank Vision Debug", display)
+            cv2.imshow(WINDOW_NAME, display)
 
             key = cv2.waitKey(1) & 0xFF
             if key == ord('q'):
