@@ -298,12 +298,12 @@ if __name__ == "__main__":
                    help="camera index to calibrate (run once per camera)")
     p.add_argument("--markers", action="store_true",
                    help="auto-detect 2 colored corner markers instead of clicking")
-    p.add_argument("--lower", type=int, nargs=3, default=[150, 120, 70],
+    p.add_argument("--lower", type=int, nargs=3, default=[135, 60, 40],
                    metavar=("H", "S", "V"),
-                   help="lower HSV bound for marker color (default: hot pink/magenta)")
-    p.add_argument("--upper", type=int, nargs=3, default=[165, 255, 255],
+                   help="lower HSV bound for marker color (default: hot pink/magenta, widened)")
+    p.add_argument("--upper", type=int, nargs=3, default=[175, 255, 255],
                    metavar=("H", "S", "V"),
-                   help="upper HSV bound for marker color (default: hot pink/magenta)")
+                   help="upper HSV bound for marker color (default: hot pink/magenta, widened)")
     args = p.parse_args()
 
     if args.markers:

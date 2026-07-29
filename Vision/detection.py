@@ -57,8 +57,16 @@ class RedBallDetector:
         self.lower_red2 = np.array([170, lower_sat, lower_val])
         self.upper_red2 = np.array([180, 255, 255])
 
-    def detect(self, frame):
+    def detect(self, frame, hsv=None):
         """Find the ball in one frame.
+
+        Parameters
+        ----------
+        hsv : optional precomputed HSV frame (blurred + cvtColor already
+            applied). Pass this in when another detector is running on
+            the same frame this tick, so the blur/color-convert cost
+            isn't paid twice -- see ColorMarkerDetector, used together in
+            debug_view.py. Leave as None to have this method compute it.
 
         Returns
         -------
@@ -68,8 +76,9 @@ class RedBallDetector:
         """
         # Blur to suppress per-pixel sensor noise, then go to HSV so the
         # color check survives lighting changes.
-        blurred = cv2.GaussianBlur(frame, (11, 11), 0)
-        hsv = cv2.cvtColor(blurred, cv2.COLOR_BGR2HSV)
+        if hsv is None:
+            blurred = cv2.GaussianBlur(frame, (5, 5), 0)
+            hsv = cv2.cvtColor(blurred, cv2.COLOR_BGR2HSV)
 
         # Two red ranges OR'd into one mask.
         mask = cv2.inRange(hsv, self.lower_red1, self.upper_red1) | \
@@ -125,13 +134,18 @@ class ColorMarkerDetector:
         Smallest contour area (in pixels) considered a real marker.
     """
 
-    def __init__(self, lower_hsv=(150, 120, 70), upper_hsv=(165, 255, 255), min_area=150):
+    def __init__(self, lower_hsv=(135, 60, 40), upper_hsv=(175, 255, 255), min_area=150):
         self.lower = np.array(lower_hsv)
         self.upper = np.array(upper_hsv)
         self.min_area = min_area
 
-    def detect(self, frame):
+    def detect(self, frame, hsv=None):
         """Find every marker blob in one frame.
+
+        Parameters
+        ----------
+        hsv : optional precomputed HSV frame -- see RedBallDetector.detect
+            for why. Leave as None to have this method compute it.
 
         Returns
         -------
@@ -140,8 +154,9 @@ class ColorMarkerDetector:
         mask    : black-and-white debug image (white = pixels judged
                   to be this color).
         """
-        blurred = cv2.GaussianBlur(frame, (11, 11), 0)
-        hsv = cv2.cvtColor(blurred, cv2.COLOR_BGR2HSV)
+        if hsv is None:
+            blurred = cv2.GaussianBlur(frame, (5, 5), 0)
+            hsv = cv2.cvtColor(blurred, cv2.COLOR_BGR2HSV)
         mask = cv2.inRange(hsv, self.lower, self.upper)
 
         mask = cv2.erode(mask, None, iterations=2)

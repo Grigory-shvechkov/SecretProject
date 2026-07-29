@@ -36,43 +36,76 @@ SIDE_CAMERA_INDEX = 2
 
 # HSV range for the corner-marker stickers. Default assumes hot pink /
 # magenta -- rare in typical aquarium environments (unlike blue, which
-# clashes with common blue tank backgrounds/gravel) and stays clear of
-# RedBallDetector's red range (170-180). Change if you used a different
-# sticker color.
-MARKER_LOWER = (150, 120, 70)
-MARKER_UPPER = (165, 255, 255)
+# clashes with common blue tank backgrounds/gravel). Widened + lowered
+# sat/val floors vs. the "ideal" magenta swatch, since real camera
+# capture (lighting, webcam color reproduction, material glossiness)
+# reads noticeably less saturated/bright than a digital color picker.
+# NOTE: the upper bound now edges into RedBallDetector's red range
+# (170-180) -- if the tracked object starts falsely registering as a
+# marker, narrow this back down using the mask view ('m') to find where
+# your actual sticker's hue sits, then tighten around it.
+MARKER_LOWER = (135, 60, 40)
+MARKER_UPPER = (175, 255, 255)
 
 DISPLAY_W = 640
 DISPLAY_H = 480
 
+# The corner stickers are physically static once placed -- re-locating
+# them from scratch every single frame is wasted CPU. Only re-run
+# ColorMarkerDetector every Nth frame; the tracked object still gets
+# checked every frame since it actually moves.
+MARKER_RECHECK_EVERY_N_FRAMES = 5
 
-def _annotate(frame, object_detector, marker_detector):
+
+def _annotate(frame, object_detector, marker_detector, last_bounds, run_marker_detection):
     """Detect on the RAW frame first, then draw. Order matters here:
     RedBallDetector.draw() paints a blue center-dot on the object, which
     is the same color family as the default marker color -- detecting
     markers on an already-annotated frame risks picking up that dot as a
     phantom corner marker. Detecting both up front avoids that entirely.
 
-    Returns (annotated_bgr, marker_mask_bgr), both resized for display.
+    hsv is computed once here and handed to both detectors instead of
+    each doing its own blur + color-convert -- that redundant pass was
+    happening 4x per loop (2 detectors x 2 cameras).
+
+    Parameters
+    ----------
+    last_bounds : the last computed marker bounds, reused when
+        run_marker_detection is False (skips ColorMarkerDetector work
+        entirely on throttled frames).
+    run_marker_detection : whether to actually re-run marker detection
+        this frame, or just keep drawing the last known rectangle.
+
+    Returns (annotated_bgr, marker_mask_bgr, bounds_to_reuse_next_call).
     """
-    object_result, _ = object_detector.detect(frame)
-    marker_centers, marker_mask = marker_detector.detect(frame)
+    blurred = cv2.GaussianBlur(frame, (5, 5), 0)
+    hsv = cv2.cvtColor(blurred, cv2.COLOR_BGR2HSV)
 
+    object_result, _ = object_detector.detect(frame, hsv=hsv)
     frame = object_detector.draw(frame, object_result)
-    frame = marker_detector.draw(frame, marker_centers)
 
-    if len(marker_centers) >= 2:
-        xs = [x for x, _ in marker_centers]
-        ys = [y for _, y in marker_centers]
-        left, right, top, bottom = min(xs), max(xs), min(ys), max(ys)
+    if run_marker_detection:
+        marker_centers, marker_mask = marker_detector.detect(frame, hsv=hsv)
+        bounds = None
+        if len(marker_centers) >= 2:
+            xs = [x for x, _ in marker_centers]
+            ys = [y for _, y in marker_centers]
+            bounds = (min(xs), max(xs), min(ys), max(ys))
+        frame = marker_detector.draw(frame, marker_centers)
+    else:
+        marker_mask = np.zeros(frame.shape[:2], dtype=np.uint8)
+        bounds = last_bounds
+
+    if bounds is not None:
+        left, right, top, bottom = bounds
         cv2.rectangle(frame, (left, top), (right, bottom), (0, 255, 0), 2)
     else:
-        cv2.putText(frame, f"{len(marker_centers)}/2+ corner markers visible",
+        cv2.putText(frame, "0/2+ corner markers visible",
                     (10, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
 
     frame = cv2.resize(frame, (DISPLAY_W, DISPLAY_H))
     marker_mask_bgr = cv2.cvtColor(cv2.resize(marker_mask, (DISPLAY_W, DISPLAY_H)), cv2.COLOR_GRAY2BGR)
-    return frame, marker_mask_bgr
+    return frame, marker_mask_bgr, bounds
 
 
 def main():
@@ -82,6 +115,9 @@ def main():
     marker_detector_side = ColorMarkerDetector(MARKER_LOWER, MARKER_UPPER)
 
     show_mask = False
+    frame_count = 0
+    front_bounds = None
+    side_bounds = None
 
     print("Debug viewer running. Q to quit, M to toggle marker-mask view.")
     with Camera(FRONT_CAMERA_INDEX) as front_cam, Camera(SIDE_CAMERA_INDEX) as side_cam:
@@ -92,8 +128,14 @@ def main():
             if front_frame is None or side_frame is None:
                 continue
 
-            front_view, front_mask = _annotate(front_frame, object_detector_front, marker_detector_front)
-            side_view, side_mask = _annotate(side_frame, object_detector_side, marker_detector_side)
+            run_markers = (frame_count % MARKER_RECHECK_EVERY_N_FRAMES == 0)
+
+            front_view, front_mask, front_bounds = _annotate(
+                front_frame, object_detector_front, marker_detector_front, front_bounds, run_markers)
+            side_view, side_mask, side_bounds = _annotate(
+                side_frame, object_detector_side, marker_detector_side, side_bounds, run_markers)
+
+            frame_count += 1
 
             cv2.putText(front_view, "FRONT", (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
             cv2.putText(side_view, "SIDE", (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
