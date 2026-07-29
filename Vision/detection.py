@@ -112,18 +112,20 @@ class ColorMarkerDetector:
     Unlike RedBallDetector, this returns ALL blobs above min_area (largest
     first), since calibration needs to see two separate markers at once.
     Pick a marker color that won't be confused with whatever's being
-    tracked -- blue works well against a red ball/fish marker.
+    tracked -- hot pink/magenta works well against a red ball/fish marker
+    and is rare in typical aquarium environments (unlike blue, which
+    commonly clashes with tank backgrounds/gravel).
 
     Parameters
     ----------
     lower_hsv, upper_hsv : (H, S, V) tuples
         Single HSV range for the marker color (no red-style hue wraparound
-        needed for most colors). Defaults to a blue range.
+        needed for most colors). Defaults to a hot pink/magenta range.
     min_area : int
         Smallest contour area (in pixels) considered a real marker.
     """
 
-    def __init__(self, lower_hsv=(100, 120, 70), upper_hsv=(130, 255, 255), min_area=150):
+    def __init__(self, lower_hsv=(150, 120, 70), upper_hsv=(165, 255, 255), min_area=150):
         self.lower = np.array(lower_hsv)
         self.upper = np.array(upper_hsv)
         self.min_area = min_area

@@ -34,11 +34,13 @@ from detection import RedBallDetector, ColorMarkerDetector
 FRONT_CAMERA_INDEX = 0
 SIDE_CAMERA_INDEX = 2
 
-# HSV range for the corner-marker stickers. Default assumes blue, chosen
-# to stay distinct from RedBallDetector's red. Change if you used a
-# different sticker color.
-MARKER_LOWER = (100, 120, 70)
-MARKER_UPPER = (130, 255, 255)
+# HSV range for the corner-marker stickers. Default assumes hot pink /
+# magenta -- rare in typical aquarium environments (unlike blue, which
+# clashes with common blue tank backgrounds/gravel) and stays clear of
+# RedBallDetector's red range (170-180). Change if you used a different
+# sticker color.
+MARKER_LOWER = (150, 120, 70)
+MARKER_UPPER = (165, 255, 255)
 
 DISPLAY_W = 640
 DISPLAY_H = 480
