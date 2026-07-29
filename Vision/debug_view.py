@@ -24,6 +24,18 @@ Controls:
     M - toggle marker-mask view (shows the raw color-threshold mask used
         to find the corner markers -- literally "where the program is
         looking" for stickers -- useful for tuning MARKER_LOWER/UPPER)
+    R - reset the accumulated multi-click HSV average (both cameras) --
+        clicking samples several pixels into a running mean instead of
+        just the last one (see _make_mouse_callback), so use R when you
+        want to start a fresh average for a different marker/location
+        instead of restarting the whole program.
+    L - lock in the currently displayed box as the trusted reference for
+        outlier rejection (both cameras) -- press this once you've
+        visually confirmed the box's alignment looks right. It hard-
+        resets the rolling box average to exactly the box on screen right
+        now, discarding any prior average, but does NOT freeze it: future
+        accepted candidates still update it normally afterward, so slow
+        legitimate drift (a nudged camera) keeps being tracked.
 
 Run from inside the Vision/ folder:
     python debug_view.py
@@ -68,6 +80,41 @@ DISPLAY_H = 480
 # checked every frame since it actually moves.
 MARKER_RECHECK_EVERY_N_FRAMES = 5
 
+# Box outlier rejection (feature 2) -- see _evaluate_box_candidate.
+BOX_EMA_ALPHA = 0.2
+# Effective smoothing window ~= 1/BOX_EMA_ALPHA = 5 ACCEPTED checks.
+# Marker rechecks only happen every MARKER_RECHECK_EVERY_N_FRAMES=5
+# frames, so 5 accepted checks = ~25 raw frames (roughly 1-2s at a
+# typical Pi USB-cam framerate) -- fast enough to absorb a deliberate
+# slow camera nudge within a couple of seconds, slow enough that any
+# single accepted-but-borderline box only nudges the average by 20%.
+
+BOX_AREA_REL_TOLERANCE = 0.35
+# Reject a candidate if its area differs from the rolling average by
+# more than 35%. Ordinary per-recheck jitter (webcam noise, a
+# sticker's detected centroid moving a few pixels, minor lighting
+# flicker) moves the fitted rectangle's area by low single-digit
+# percent. A false-positive blob replacing one real corner marker is
+# a point from somewhere ELSE in the frame (background clutter, a
+# reflection), not a jittered version of the true corner -- since
+# cv2.minAreaRect's enclosing rectangle must stretch to cover that
+# outlier point along with the 3 good ones, this typically inflates
+# the fitted area by 50-100%+. 0.35 sits comfortably above normal
+# jitter and comfortably below a real swap.
+
+BOX_CENTROID_TOLERANCE_FRAC = 0.35
+# Reject a candidate if its centroid shifts, from the rolling
+# average's centroid, by more than 0.35 * (rolling average's
+# perimeter / 4). perimeter/4 is used as a scale-invariant "average
+# side length" so the same fraction works regardless of camera
+# resolution/zoom. A centroid is the mean of 4 points, so one bad
+# corner offset by delta shifts the centroid by delta/4 -- and
+# because the false blob is generally far from the true corner (not
+# merely nearby), that delta is typically a large fraction of the
+# box's own size, well above 0.35x a side length. This is a backup
+# signal to the area check above (catches a bad point that happens
+# to have a similar area footprint but is displaced sideways).
+
 
 def _rect_from_markers(centers):
     """Turn marker centers into rectangle corners.
@@ -94,10 +141,67 @@ def _rect_from_markers(centers):
     points = np.array(centers, dtype=np.float32)
     rect = cv2.minAreaRect(points)
     box = cv2.boxPoints(rect)
-    return [(int(x), int(y)) for x, y in box]
+    return [(int(round(x)), int(round(y))) for x, y in box]
 
 
-def _annotate(frame, object_detector, marker_detector, last_box, run_marker_detection):
+def _box_metrics(points):
+    """Rotation-invariant summary of a 4-point box: centroid, area,
+    perimeter. Deliberately never touches cv2.minAreaRect's angle
+    output -- that value is known to jump discontinuously between
+    ranges across OpenCV versions even for a physically stationary,
+    unrotated box, so it is unusable for frame-to-frame comparison.
+    Centroid/area/perimeter are all invariant to which corner
+    cv2.boxPoints happened to list first or what angle convention
+    was used to construct an equivalent rectangle, so they sidestep
+    the wraparound bug entirely rather than patching around it."""
+    pts = np.array(points, dtype=np.float32)
+    cx, cy = float(pts[:, 0].mean()), float(pts[:, 1].mean())
+    area = float(cv2.contourArea(pts))
+    perim = float(cv2.arcLength(pts, True))
+    return cx, cy, area, perim
+
+
+def _evaluate_box_candidate(stats, candidate_points):
+    """stats is None (no history yet) or a dict {"cx","cy","area","perim"}.
+    Returns (accept: bool, new_stats: dict). On reject, new_stats is
+    returned UNCHANGED -- a rejected candidate never pollutes the
+    rolling average, only an accepted one does."""
+    cx, cy, area, perim = _box_metrics(candidate_points)
+
+    if stats is None:
+        # Bootstrap: the very first-ever candidate for this side has
+        # nothing to compare against. Always accept, and seed the
+        # average directly from this box's own metrics (not
+        # EMA-blended -- there is no prior mean to blend with).
+        return True, {"cx": cx, "cy": cy, "area": area, "perim": perim}
+
+    area_dev = abs(area - stats["area"]) / max(stats["area"], 1.0)
+    side_len = max(stats["perim"], 1.0) / 4.0
+    centroid_shift = ((cx - stats["cx"]) ** 2 + (cy - stats["cy"]) ** 2) ** 0.5
+
+    if area_dev > BOX_AREA_REL_TOLERANCE or centroid_shift > BOX_CENTROID_TOLERANCE_FRAC * side_len:
+        return False, stats
+
+    a = BOX_EMA_ALPHA
+    new_stats = {
+        "cx": (1 - a) * stats["cx"] + a * cx,
+        "cy": (1 - a) * stats["cy"] + a * cy,
+        "area": (1 - a) * stats["area"] + a * area,
+        "perim": (1 - a) * stats["perim"] + a * perim,
+    }
+    return True, new_stats
+
+
+def _lock_box(points):
+    """Hard-reset seed for lock-in: returns a fresh stats dict built
+    directly from the given box's own metrics, discarding any prior
+    EMA state entirely (identical math to the bootstrap branch of
+    _evaluate_box_candidate)."""
+    cx, cy, area, perim = _box_metrics(points)
+    return {"cx": cx, "cy": cy, "area": area, "perim": perim}
+
+
+def _annotate(frame, object_detector, marker_detector, last_box, run_marker_detection, box_stats, label=""):
     """Detect on the RAW frame first, then draw. Order matters here:
     RedBallDetector.draw() paints a blue center-dot on the object, which
     is the same color family as the default marker color -- detecting
@@ -115,8 +219,21 @@ def _annotate(frame, object_detector, marker_detector, last_box, run_marker_dete
         see below for why that matters.
     run_marker_detection : whether to actually re-run marker detection
         this frame, or just keep drawing the last known rectangle.
+    box_stats : rolling-average stats dict for THIS side (see
+        _evaluate_box_candidate), or None if no box has been accepted
+        yet. Even when a full marker set is found, the candidate box
+        built from it still has to pass this outlier check before it's
+        accepted/drawn -- guards against a false-positive blob (a
+        reflection, background clutter) that happened to out-rank a
+        real sticker in area and got treated as one of the "full set" of
+        EXPECTED_MARKERS, which would otherwise still make it into
+        cv2.minAreaRect via _rect_from_markers and produce a badly wrong
+        (but still "complete") box.
+    label : "FRONT"/"SIDE", used only for the console message printed
+        when a candidate is rejected.
 
-    Returns (annotated_bgr, marker_mask_bgr, box_to_reuse_next_call, hsv_for_sampling).
+    Returns (annotated_bgr, marker_mask_bgr, box_to_reuse_next_call,
+    box_stats_to_reuse_next_call, hsv_for_sampling).
     """
     blurred = cv2.GaussianBlur(frame, (5, 5), 0)
     hsv = cv2.cvtColor(blurred, cv2.COLOR_BGR2HSV)
@@ -139,7 +256,18 @@ def _annotate(frame, object_detector, marker_detector, last_box, run_marker_dete
         # too-big/too-small/half-size on every recheck.
         box = last_box
         if len(marker_centers) >= EXPECTED_MARKERS:
-            box = _rect_from_markers(marker_centers)
+            candidate = _rect_from_markers(marker_centers)
+            # A "full set" can still be WRONG: a false-positive blob can
+            # out-rank a real sticker in area and sit among the top-N,
+            # producing a complete-but-badly-wrong rectangle. Gate the
+            # candidate against the rolling average before trusting it.
+            accepted, box_stats = _evaluate_box_candidate(box_stats, candidate)
+            if accepted:
+                box = candidate
+            else:
+                print(f"{label} box candidate rejected as outlier "
+                      f"(area/centroid deviate from rolling average); "
+                      f"reusing last known-good box.")
         frame = marker_detector.draw(frame, marker_centers)
     else:
         marker_mask = np.zeros(frame.shape[:2], dtype=np.uint8)
@@ -157,37 +285,101 @@ def _annotate(frame, object_detector, marker_detector, last_box, run_marker_dete
     # Resized to match the displayed frame, so a click's (x, y) in the
     # window maps directly onto this array with no extra scaling math.
     hsv_display = cv2.resize(hsv, (DISPLAY_W, DISPLAY_H))
-    return frame, marker_mask_bgr, box, hsv_display
+    return frame, marker_mask_bgr, box, box_stats, hsv_display
 
 
 WINDOW_NAME = "Fish Tank Vision Debug"
 
 
-def _make_mouse_callback(sampled_hsv):
+def _new_hsv_stats():
+    """Fresh, empty running-average accumulator for one camera side."""
+    return {"n": 0, "sin_sum": 0.0, "cos_sum": 0.0, "s_sum": 0.0, "v_sum": 0.0}
+
+
+def _update_hsv_stats(stats, h, s, v):
+    """H uses a circular mean (accumulate as a unit vector at angle
+    h*2 degrees, recover via atan2) since OpenCV hue is circular over
+    [0,180) representing the full 0-360 degree wheel, and this
+    project's own MARKER_UPPER=175 sits only 5 degrees from that
+    seam -- a plain arithmetic mean would silently break the moment
+    clicked samples straddle it (e.g. 178 and 2 averaging to ~90,
+    which is nowhere near either). S and V are ordinary linear
+    channels and use a plain running-sum mean."""
+    stats["n"] += 1
+    angle = np.deg2rad(float(h) * 2.0)
+    stats["sin_sum"] += np.sin(angle)
+    stats["cos_sum"] += np.cos(angle)
+    stats["s_sum"] += float(s)
+    stats["v_sum"] += float(v)
+
+
+def _hsv_mean(stats):
+    """Returns (mean_h, mean_s, mean_v, n), or None if no samples yet."""
+    if stats["n"] == 0:
+        return None
+    mean_h = (np.degrees(np.arctan2(stats["sin_sum"], stats["cos_sum"])) / 2.0) % 180.0
+    # atan2 can land a hair below 0 for samples straddling the exact
+    # hue wrap seam (e.g. h=178 and h=2, whose unit vectors nearly
+    # cancel in sin), which the % 180.0 above turns into ~179.99999...
+    # instead of ~0.0 -- the same hue point in OpenCV's 0-179 space,
+    # just on the wrong side of the seam due to floating-point sign.
+    # Snap that artifact back to 0.0 rather than displaying "180.0".
+    if mean_h > 180.0 - 1e-6:
+        mean_h = 0.0
+    mean_s = stats["s_sum"] / stats["n"]
+    mean_v = stats["v_sum"] / stats["n"]
+    return mean_h, mean_s, mean_v, stats["n"]
+
+
+def _make_mouse_callback(sampled_hsv, hsv_stats):
     """Returns an OpenCV mouse callback that prints the HSV value of
     whatever pixel you click. Use this to read the color your camera
     ACTUALLY captures for a marker or for background clutter -- printer
     ink, tank lighting, and webcam color reproduction all shift a color
     from what a swatch/screen suggests, so this beats guessing at ranges.
 
+    Each click also folds into a running mean HSV for that side (see
+    _update_hsv_stats/_hsv_mean) instead of only reporting that one raw
+    pixel -- a single click can land on a shadowed/glare-y patch of a
+    marker, so clicking several different markers/spots and reading the
+    running average gives a far more representative color to threshold
+    against. Press 'r' (see main()) to reset the accumulator and start a
+    fresh average for a different color/location.
+
     sampled_hsv is a dict {"front": hsv_array_or_None, "side": ...} kept
     up to date by the main loop -- the callback just reads whatever's
     currently in it when a click happens.
+
+    hsv_stats is a dict {"front": stats_dict, "side": stats_dict} (see
+    _new_hsv_stats) that this callback updates and reads in place, and
+    that main()'s 'r' key handler resets.
     """
     def on_mouse(event, x, y, flags, param):
         if event != cv2.EVENT_LBUTTONDOWN:
             return
 
         if x < DISPLAY_W:
-            label, hsv_frame, px, py = "FRONT", sampled_hsv.get("front"), x, y
+            label, hsv_frame, px, py, side_key = "FRONT", sampled_hsv.get("front"), x, y, "front"
         else:
-            label, hsv_frame, px, py = "SIDE", sampled_hsv.get("side"), x - DISPLAY_W, y
+            label, hsv_frame, px, py, side_key = "SIDE", sampled_hsv.get("side"), x - DISPLAY_W, y, "side"
 
         if hsv_frame is None:
             return
 
+        # Defensive bounds check: currently always in-range because
+        # cv2.namedWindow(WINDOW_NAME) uses the default WINDOW_AUTOSIZE
+        # flag (the window can't be manually resized, so click coords
+        # always fall within the displayed frame) -- but indexing
+        # unchecked would be fragile if that ever changes.
+        frame_h, frame_w = hsv_frame.shape[:2]
+        if not (0 <= px < frame_w and 0 <= py < frame_h):
+            return
+
         h, s, v = hsv_frame[py, px]
-        print(f"{label} click at ({px},{py}) -> HSV ({h}, {s}, {v})")
+        _update_hsv_stats(hsv_stats[side_key], h, s, v)
+        mean_h, mean_s, mean_v, n = _hsv_mean(hsv_stats[side_key])
+        print(f"{label} click #{n} at ({px},{py}) -> HSV ({h}, {s}, {v}) | "
+              f"running mean HSV ({mean_h:.1f}, {mean_s:.1f}, {mean_v:.1f}) over {n} sample(s)")
 
     return on_mouse
 
@@ -202,12 +394,20 @@ def main():
     frame_count = 0
     front_box = None
     side_box = None
+    # Rolling-average box stats per side, for outlier rejection (feature
+    # 2). None until the first box is ever accepted (or until 'l' locks
+    # one in) -- see _evaluate_box_candidate for why None always accepts.
+    front_box_stats = None
+    side_box_stats = None
 
     sampled_hsv = {"front": None, "side": None}
+    hsv_stats = {"front": _new_hsv_stats(), "side": _new_hsv_stats()}
     cv2.namedWindow(WINDOW_NAME)
-    cv2.setMouseCallback(WINDOW_NAME, _make_mouse_callback(sampled_hsv))
+    cv2.setMouseCallback(WINDOW_NAME, _make_mouse_callback(sampled_hsv, hsv_stats))
 
-    print("Debug viewer running. Q to quit, M to toggle marker-mask view, click to print a pixel's HSV.")
+    print("Debug viewer running. Q to quit, M to toggle marker-mask view, "
+          "R to reset HSV click average, L to lock in the current box, "
+          "click to sample HSV (accumulates a running average).")
     with Camera(FRONT_CAMERA_INDEX) as front_cam, Camera(SIDE_CAMERA_INDEX) as side_cam:
         while True:
             front_frame = front_cam.read()
@@ -218,10 +418,12 @@ def main():
 
             run_markers = (frame_count % MARKER_RECHECK_EVERY_N_FRAMES == 0)
 
-            front_view, front_mask, front_box, front_hsv = _annotate(
-                front_frame, object_detector_front, marker_detector_front, front_box, run_markers)
-            side_view, side_mask, side_box, side_hsv = _annotate(
-                side_frame, object_detector_side, marker_detector_side, side_box, run_markers)
+            front_view, front_mask, front_box, front_box_stats, front_hsv = _annotate(
+                front_frame, object_detector_front, marker_detector_front, front_box,
+                run_markers, front_box_stats, label="FRONT")
+            side_view, side_mask, side_box, side_box_stats, side_hsv = _annotate(
+                side_frame, object_detector_side, marker_detector_side, side_box,
+                run_markers, side_box_stats, label="SIDE")
 
             sampled_hsv["front"] = front_hsv
             sampled_hsv["side"] = side_hsv
@@ -233,7 +435,7 @@ def main():
 
             display = np.hstack([front_mask, side_mask]) if show_mask else np.hstack([front_view, side_view])
 
-            cv2.putText(display, "Q: quit   M: toggle marker-mask   click: sample HSV",
+            cv2.putText(display, "Q: quit  M: mask  R: reset HSV samples  L: lock-in box  click: sample HSV (avg)",
                         (10, display.shape[0] - 10),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (180, 180, 180), 1)
 
@@ -244,6 +446,34 @@ def main():
                 break
             if key == ord('m'):
                 show_mask = not show_mask
+
+            if key == ord('r'):
+                hsv_stats["front"] = _new_hsv_stats()
+                hsv_stats["side"] = _new_hsv_stats()
+                print("HSV click accumulator reset (front & side).")
+
+            if key == ord('l'):
+                # Hard-reset the rolling box average to exactly what's
+                # currently on screen -- the user has visually confirmed
+                # it looks right, so it should immediately become the
+                # trusted reference, overriding whatever the automatic
+                # EMA had been tracking (which might be contaminated by
+                # a run of borderline-but-accepted candidates). This is
+                # NOT a permanent freeze: _evaluate_box_candidate runs
+                # exactly as normal afterward, so the system keeps
+                # absorbing genuinely-good future candidates and can
+                # still track slow legitimate drift (e.g. a later camera
+                # nudge) without needing 'l' pressed again.
+                if front_box is not None:
+                    front_box_stats = _lock_box(front_box)
+                    print(f"FRONT box locked in as trusted reference (area={front_box_stats['area']:.0f}).")
+                else:
+                    print("FRONT: no box currently displayed, nothing to lock in.")
+                if side_box is not None:
+                    side_box_stats = _lock_box(side_box)
+                    print(f"SIDE box locked in as trusted reference (area={side_box_stats['area']:.0f}).")
+                else:
+                    print("SIDE: no box currently displayed, nothing to lock in.")
 
     cv2.destroyAllWindows()
 

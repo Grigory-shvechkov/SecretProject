@@ -433,13 +433,18 @@ def _print_report(slots):
     print("\n" + "=" * 72)
     print("CANDIDATE RANKING")
     print("=" * 72)
+    def _fmt(v):
+        # Score fields are None right after a sample is taken/relabeled
+        # or after 'k' changes (rederive() invalidates them on purpose --
+        # see Sample.rederive) until 'e' is pressed again. Never format
+        # None with a numeric spec; show "n/a" instead.
+        return f"{v:5.1f}" if v is not None else "  n/a"
+
     for rank, (n, s) in enumerate(ranked, start=1):
-        score_str = f"{s.final_score:5.1f}" if s.final_score is not None else "  n/a"
-        bg_str = f"{s.background_score:5.1f}" if s.background_score is not None else "  n/a"
         wrap_flag = " [WRAPS 0/180 -- see note below]" if s.hue_wraps else ""
         print(f"#{rank}  slot {n} \"{s.label}\"{wrap_flag}")
-        print(f"      final={score_str}  consistency={s.consistency_score:5.1f}  "
-              f"segmentation={s.segmentation_score:5.1f}  background={bg_str}")
+        print(f"      final={_fmt(s.final_score)}  consistency={_fmt(s.consistency_score)}  "
+              f"segmentation={_fmt(s.segmentation_score)}  background={_fmt(s.background_score)}")
         print(f"      sampled HSV mean=({s.mean_hsv[0]:.1f}, {s.mean_hsv[1]:.1f}, "
               f"{s.mean_hsv[2]:.1f})  std=({s.std_hsv[0]:.1f}, {s.std_hsv[1]:.1f}, "
               f"{s.std_hsv[2]:.1f})  n={s.n_pixels}px")
@@ -524,6 +529,27 @@ def _draw_hud(frame, state):
     return frame
 
 
+def _sync_mask_window(state, frame, hsv):
+    """Show or hide the mask-preview window for the currently-armed slot,
+    reflecting the 'm' toggle. Kept as its OWN window rather than an
+    in-place swap of the main feed (see module docstring) so the main
+    window is always available to drag a new sample rectangle on.
+    """
+    active = state["active_slot"]
+    sample = state["slots"].get(active) if active is not None else None
+
+    if state["show_mask"] and sample is not None:
+        detector = ColorMarkerDetector(sample.lower, sample.upper, min_area=state["min_area"])
+        _, mask = detector.detect(frame, hsv=hsv)
+        cv2.imshow(MASK_WINDOW_NAME, mask)
+    else:
+        try:
+            if cv2.getWindowProperty(MASK_WINDOW_NAME, cv2.WND_PROP_VISIBLE) >= 0:
+                cv2.destroyWindow(MASK_WINDOW_NAME)
+        except cv2.error:
+            pass
+
+
 def _make_mouse_callback(state):
     def on_mouse(event, x, y, flags, param):
         if event == cv2.EVENT_LBUTTONDOWN:
@@ -589,7 +615,7 @@ def main():
                              f"(default: {DEFAULT_K})")
     args = parser.parse_args()
 
-    state = {
+    state: dict = {
         "slots": {n: None for n in range(1, 10)},
         # Labels live separately from Sample objects so a slot can be
         # named ("hot pink tape") BEFORE it's ever sampled -- useful
@@ -635,22 +661,7 @@ def main():
             display = _draw_hud(display, state)
             cv2.imshow(WINDOW_NAME, display)
 
-            if state["show_mask"] and state["active_slot"] is not None:
-                active_sample = state["slots"][state["active_slot"]]
-                if active_sample is not None:
-                    detector = ColorMarkerDetector(active_sample.lower, active_sample.upper,
-                                                    min_area=state["min_area"])
-                    _, mask = detector.detect(frame, hsv=hsv)
-                    cv2.imshow(MASK_WINDOW_NAME, mask)
-                else:
-                    cv2.destroyWindow(MASK_WINDOW_NAME) if cv2.getWindowProperty(
-                        MASK_WINDOW_NAME, 0) >= 0 else None
-            elif not state["show_mask"]:
-                try:
-                    if cv2.getWindowProperty(MASK_WINDOW_NAME, 0) >= 0:
-                        cv2.destroyWindow(MASK_WINDOW_NAME)
-                except cv2.error:
-                    pass
+            _sync_mask_window(state, frame, hsv)
 
             key = cv2.waitKey(1) & 0xFF
 
