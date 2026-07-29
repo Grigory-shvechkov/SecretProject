@@ -86,7 +86,11 @@ def _annotate(frame, object_detector, marker_detector, last_bounds, run_marker_d
 
     if run_marker_detection:
         marker_centers, marker_mask = marker_detector.detect(frame, hsv=hsv)
-        bounds = None
+        # Fall back to the last known good box on a transient miss --
+        # only overwrite it when this check actually finds 2+ markers.
+        # Nulling it out here would flash the box off for one bad frame
+        # even though nothing physically moved.
+        bounds = last_bounds
         if len(marker_centers) >= 2:
             xs = [x for x, _ in marker_centers]
             ys = [y for _, y in marker_centers]
