@@ -422,6 +422,12 @@ def main():
             side_frame = side_cam.read()
 
             if front_frame is None or side_frame is None:
+                # A camera that failed to open (see capture.py) reads as
+                # None forever -- wait briefly instead of busy-spinning
+                # the CPU, and keep 'q' working to quit even when no
+                # camera is available at all to drive cv2.waitKey below.
+                if (cv2.waitKey(200) & 0xFF) == ord('q'):
+                    break
                 continue
 
             run_markers = (frame_count % MARKER_RECHECK_EVERY_N_FRAMES == 0)
