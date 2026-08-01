@@ -13,7 +13,9 @@ every frame -- no manual calibration step:
      when the FULL expected set is found in one check -- a partial set
      (one sticker occluded/dropped out) keeps the last good box instead
      of shrinking to fit whatever's currently visible.
-  2. The tracked object (red ball / fish), circled, if currently visible.
+  2. The tracked object (fish), boxed by FishDetector (YOLO), if
+     currently visible -- color filtering is used ONLY for the corner
+     markers now, not for finding the fish itself.
 
 This is a development tool, not part of the production loop (run.py) --
 it needs an actual display (local monitor, or VNC/X11-forwarded SSH),
@@ -52,17 +54,24 @@ import cv2
 import numpy as np
 
 from capture import Camera
-from detection import RedBallDetector, ColorMarkerDetector
+from detection import FishDetector, ColorMarkerDetector
 
 FRONT_CAMERA_INDEX = 0
 SIDE_CAMERA_INDEX = 2
 
-# HSV range for the corner-marker stickers. Default assumes yellow --
-# distinct from RedBallDetector's red range (0-10 / 170-180), so the two
-# never overlap. Widened + lowered sat/val floors vs. an "ideal" yellow
-# swatch, since real camera capture (lighting, webcam color reproduction,
-# material glossiness) reads noticeably less saturated/bright than a
-# digital color picker.
+# Stock yolov8n.pt has NO fish class (see detection.py's FishDetector
+# docstring) -- fine for confirming this viewer's pipeline runs, useless
+# for real fish tracking until pointed at fish-trained weights. Expect
+# ~1-3s/frame on a Pi 3, much slower than the old color-filtering
+# RedBallDetector -- this viewer will visibly lag per-frame now.
+FISH_MODEL_PATH = "yolov8n.pt"
+FISH_CONF_THRESHOLD = 0.4
+
+# HSV range for the corner-marker stickers. Default assumes yellow,
+# distinct from typical tank contents. Widened + lowered sat/val floors
+# vs. an "ideal" yellow swatch, since real camera capture (lighting,
+# webcam color reproduction, material glossiness) reads noticeably less
+# saturated/bright than a digital color picker.
 # NOTE: yellow can clash with warm tank lighting or yellow-toned gravel/
 # decor -- if background clutter starts falsely registering as a marker,
 # narrow this range using the mask view ('m') to find where your actual
@@ -234,14 +243,20 @@ def _lock_box(points):
 
 def _annotate(frame, object_detector, marker_detector, last_box, run_marker_detection, box_stats, label=""):
     """Detect on the RAW frame first, then draw. Order matters here:
-    RedBallDetector.draw() paints a blue center-dot on the object, which
-    is the same color family as the default marker color -- detecting
-    markers on an already-annotated frame risks picking up that dot as a
-    phantom corner marker. Detecting both up front avoids that entirely.
+    object_detector is FishDetector (YOLO) now, whose draw() doesn't
+    paint onto the frame we hand it -- raw.plot() returns a FRESH
+    annotated image built from the same raw frame YOLO was given, so if
+    marker detection ran on that already-annotated copy instead of the
+    original, it would waste the whole point of detecting up front: any
+    YOLO box/label pixels that happened to match the marker color could
+    get picked up as a phantom corner marker. Detecting both up front,
+    strictly from the raw frame, avoids that regardless of which
+    detector's draw() mutates in place vs. returns a copy.
 
-    hsv is computed once here and handed to both detectors instead of
-    each doing its own blur + color-convert -- that redundant pass was
-    happening 4x per loop (2 detectors x 2 cameras).
+    hsv is computed once here and handed to marker_detector instead of
+    it doing its own blur + color-convert -- that redundant pass was
+    happening 2x per loop (2 cameras). object_detector (YOLO) has no use
+    for hsv at all, unlike the old color-based RedBallDetector.
 
     Parameters
     ----------
@@ -269,8 +284,8 @@ def _annotate(frame, object_detector, marker_detector, last_box, run_marker_dete
     blurred = cv2.GaussianBlur(frame, (5, 5), 0)
     hsv = cv2.cvtColor(blurred, cv2.COLOR_BGR2HSV)
 
-    object_result, _ = object_detector.detect(frame, hsv=hsv)
-    frame = object_detector.draw(frame, object_result)
+    _, object_raw = object_detector.detect(frame)
+    frame = object_detector.draw(frame, object_raw)
 
     if run_marker_detection:
         marker_centers, marker_mask = marker_detector.detect(frame, hsv=hsv)
@@ -416,8 +431,8 @@ def _make_mouse_callback(sampled_hsv, hsv_stats):
 
 
 def main():
-    object_detector_front = RedBallDetector()
-    object_detector_side = RedBallDetector()
+    object_detector_front = FishDetector(model_path=FISH_MODEL_PATH, conf=FISH_CONF_THRESHOLD)
+    object_detector_side = FishDetector(model_path=FISH_MODEL_PATH, conf=FISH_CONF_THRESHOLD)
     marker_detector_front = ColorMarkerDetector(MARKER_LOWER, MARKER_UPPER)
     marker_detector_side = ColorMarkerDetector(MARKER_LOWER, MARKER_UPPER)
 
