@@ -39,10 +39,9 @@ interactive helpers at the bottom of this file:
 
 The --markers mode looks for two physical markers (stickers/tape/paper)
 placed at diagonally-opposite interior corners of the tank, in a color
-distinct from whatever's being tracked (default assumes hot pink/magenta,
-since red is taken by RedBallDetector and blue commonly clashes with tank
-backgrounds/gravel). No clicking needed -- point the camera,
-confirm both markers are highlighted, press 's'.
+distinct from whatever's being tracked (default assumes yellow, since
+red is taken by RedBallDetector). No clicking needed -- point the
+camera, confirm both markers are highlighted, press 's'.
 
 Limitations (fine for tracking, know them anyway):
 * Linear mapping ignores water refraction and lens distortion, so
@@ -298,12 +297,12 @@ if __name__ == "__main__":
                    help="camera index to calibrate (run once per camera)")
     p.add_argument("--markers", action="store_true",
                    help="auto-detect 2 colored corner markers instead of clicking")
-    p.add_argument("--lower", type=int, nargs=3, default=[135, 60, 40],
+    p.add_argument("--lower", type=int, nargs=3, default=[20, 60, 40],
                    metavar=("H", "S", "V"),
-                   help="lower HSV bound for marker color (default: hot pink/magenta, widened)")
-    p.add_argument("--upper", type=int, nargs=3, default=[175, 255, 255],
+                   help="lower HSV bound for marker color (default: yellow, widened)")
+    p.add_argument("--upper", type=int, nargs=3, default=[35, 255, 255],
                    metavar=("H", "S", "V"),
-                   help="upper HSV bound for marker color (default: hot pink/magenta, widened)")
+                   help="upper HSV bound for marker color (default: yellow, widened)")
     args = p.parse_args()
 
     if args.markers:

@@ -36,6 +36,13 @@ Controls:
         now, discarding any prior average, but does NOT freeze it: future
         accepted candidates still update it normally afterward, so slow
         legitimate drift (a nudged camera) keeps being tracked.
+    C - clear box tracking entirely (both cameras) if it's stuck showing
+        a wrong/off-axis box. Different from L: L re-locks whatever's
+        CURRENTLY displayed, which does nothing if that's the stuck box
+        itself. C wipes the box and its rolling average back to "no
+        history yet," so the next full marker detection is accepted
+        unconditionally instead of being rejected as an outlier against
+        the very reference that's wrong.
 
 Run from inside the Vision/ folder:
     python debug_view.py
@@ -50,18 +57,18 @@ from detection import RedBallDetector, ColorMarkerDetector
 FRONT_CAMERA_INDEX = 0
 SIDE_CAMERA_INDEX = 2
 
-# HSV range for the corner-marker stickers. Default assumes hot pink /
-# magenta -- rare in typical aquarium environments (unlike blue, which
-# clashes with common blue tank backgrounds/gravel). Widened + lowered
-# sat/val floors vs. the "ideal" magenta swatch, since real camera
-# capture (lighting, webcam color reproduction, material glossiness)
-# reads noticeably less saturated/bright than a digital color picker.
-# NOTE: the upper bound now edges into RedBallDetector's red range
-# (170-180) -- if the tracked object starts falsely registering as a
-# marker, narrow this back down using the mask view ('m') to find where
-# your actual sticker's hue sits, then tighten around it.
-MARKER_LOWER = (135, 60, 40)
-MARKER_UPPER = (175, 255, 255)
+# HSV range for the corner-marker stickers. Default assumes yellow --
+# distinct from RedBallDetector's red range (0-10 / 170-180), so the two
+# never overlap. Widened + lowered sat/val floors vs. an "ideal" yellow
+# swatch, since real camera capture (lighting, webcam color reproduction,
+# material glossiness) reads noticeably less saturated/bright than a
+# digital color picker.
+# NOTE: yellow can clash with warm tank lighting or yellow-toned gravel/
+# decor -- if background clutter starts falsely registering as a marker,
+# narrow this range using the mask view ('m') to find where your actual
+# sticker's hue sits, then tighten around it.
+MARKER_LOWER = (20, 60, 40)
+MARKER_UPPER = (35, 255, 255)
 
 # How many corner stickers you actually placed (2 diagonal, or 4, one per
 # corner). ColorMarkerDetector returns every blob above min_area sorted
@@ -300,9 +307,9 @@ def _update_hsv_stats(stats, h, s, v):
     """H uses a circular mean (accumulate as a unit vector at angle
     h*2 degrees, recover via atan2) since OpenCV hue is circular over
     [0,180) representing the full 0-360 degree wheel, and this
-    project's own MARKER_UPPER=175 sits only 5 degrees from that
-    seam -- a plain arithmetic mean would silently break the moment
-    clicked samples straddle it (e.g. 178 and 2 averaging to ~90,
+    project's own RedBallDetector range (170-180 / 0-10) sits right on
+    top of that seam -- a plain arithmetic mean would silently break the
+    moment clicked samples straddle it (e.g. 178 and 2 averaging to ~90,
     which is nowhere near either). S and V are ordinary linear
     channels and use a plain running-sum mean."""
     stats["n"] += 1
@@ -407,6 +414,7 @@ def main():
 
     print("Debug viewer running. Q to quit, M to toggle marker-mask view, "
           "R to reset HSV click average, L to lock in the current box, "
+          "C to clear box tracking if it's stuck, "
           "click to sample HSV (accumulates a running average).")
     with Camera(FRONT_CAMERA_INDEX) as front_cam, Camera(SIDE_CAMERA_INDEX) as side_cam:
         while True:
@@ -435,7 +443,7 @@ def main():
 
             display = np.hstack([front_mask, side_mask]) if show_mask else np.hstack([front_view, side_view])
 
-            cv2.putText(display, "Q: quit  M: mask  R: reset HSV samples  L: lock-in box  click: sample HSV (avg)",
+            cv2.putText(display, "Q: quit  M: mask  R: reset HSV  L: lock-in box  C: clear box  click: sample HSV",
                         (10, display.shape[0] - 10),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (180, 180, 180), 1)
 
@@ -451,6 +459,23 @@ def main():
                 hsv_stats["front"] = _new_hsv_stats()
                 hsv_stats["side"] = _new_hsv_stats()
                 print("HSV click accumulator reset (front & side).")
+
+            if key == ord('c'):
+                # Full reset, not a re-lock: 'l' only re-confirms whatever
+                # box is CURRENTLY displayed, which is useless if that box
+                # is itself the stuck/wrong one -- there's nothing else to
+                # lock onto. 'c' clears both the displayed box and its
+                # rolling-average stats back to the bootstrap state (None),
+                # so the very next full marker detection is accepted
+                # unconditionally (see _evaluate_box_candidate's stats-is-
+                # None branch) regardless of how different it is from the
+                # old stuck box, instead of being rejected as an "outlier"
+                # relative to the very reference that's wrong.
+                front_box = None
+                side_box = None
+                front_box_stats = None
+                side_box_stats = None
+                print("Box tracking cleared (front & side) -- waiting for a fresh detection.")
 
             if key == ord('l'):
                 # Hard-reset the rolling box average to exactly what's
