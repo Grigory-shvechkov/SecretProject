@@ -5,3 +5,22 @@
 #     sudo apt install -y python3-opencv
 numpy
 requests
+
+# ultralytics (YOLO, used by Vision/detection.py's FishDetector) lists
+# opencv-python as one of ITS OWN dependencies -- a plain `pip install -r
+# requirements.txt` will try to build that from source and hit the exact
+# same OpenEXR failure as above, because apt's python3-opencv doesn't
+# register as pip's "opencv-python" package, so pip can't tell cv2 is
+# already installed and satisfied.
+#
+# If this line makes the install fail while building opencv-python,
+# install it separately with its own dependency check skipped instead:
+#     pip install --no-deps ultralytics
+#     python3 -c "from ultralytics import YOLO"
+# The second command will ImportError on whatever ultralytics actually
+# still needs (torch, torchvision, pyyaml, pillow, tqdm, matplotlib,
+# pandas, psutil, py-cpuinfo, scipy, ultralytics-thop, as of this
+# writing) -- pip install each one it names, re-running the check until
+# it passes. torch/torchvision in particular usually need a Pi-specific
+# wheel from https://www.piwheels.org rather than plain PyPI.
+ultralytics
