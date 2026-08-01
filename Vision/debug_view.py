@@ -87,6 +87,10 @@ DISPLAY_H = 480
 # checked every frame since it actually moves.
 MARKER_RECHECK_EVERY_N_FRAMES = 5
 
+# Matches Camera's default capture size (width=640, height=480), used for
+# the placeholder frame shown when a camera is missing.
+NO_CAMERA_PLACEHOLDER_SIZE = (480, 640)  # (height, width)
+
 # Box outlier rejection (feature 2) -- see _evaluate_box_candidate.
 BOX_EMA_ALPHA = 0.2
 # Effective smoothing window ~= 1/BOX_EMA_ALPHA = 5 ACCEPTED checks.
@@ -121,6 +125,26 @@ BOX_CENTROID_TOLERANCE_FRAC = 0.35
 # box's own size, well above 0.35x a side length. This is a backup
 # signal to the area check above (catches a bad point that happens
 # to have a similar area footprint but is displaced sideways).
+
+
+def _placeholder_frame(label):
+    """Blank BGR frame substituted for a missing camera's read().
+
+    Without this, a missing camera would make the main loop skip straight
+    past cv2.imshow()/cv2.waitKey() every tick -- and a namedWindow that
+    never once receives imshow() doesn't fully realize on some backends
+    (notably on the Pi), which is what made the window look permanently
+    black and unresponsive to keys even after capture.py stopped hanging
+    on the camera itself. Using a placeholder keeps the normal
+    detect-draw-show-waitKey pipeline running unconditionally every tick,
+    so the window and its keybindings behave the same whether or not a
+    camera is actually present.
+    """
+    h, w = NO_CAMERA_PLACEHOLDER_SIZE
+    frame = np.zeros((h, w, 3), dtype=np.uint8)
+    cv2.putText(frame, f"{label}: NO CAMERA", (20, h // 2),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+    return frame
 
 
 def _rect_from_markers(centers):
@@ -421,14 +445,14 @@ def main():
             front_frame = front_cam.read()
             side_frame = side_cam.read()
 
-            if front_frame is None or side_frame is None:
-                # A camera that failed to open (see capture.py) reads as
-                # None forever -- wait briefly instead of busy-spinning
-                # the CPU, and keep 'q' working to quit even when no
-                # camera is available at all to drive cv2.waitKey below.
-                if (cv2.waitKey(200) & 0xFF) == ord('q'):
-                    break
-                continue
+            # A camera that failed to open (see capture.py's Camera
+            # warning) or is between frames reads as None -- substitute a
+            # placeholder so imshow()/waitKey() below always run every
+            # tick regardless (see _placeholder_frame).
+            if front_frame is None:
+                front_frame = _placeholder_frame("FRONT")
+            if side_frame is None:
+                side_frame = _placeholder_frame("SIDE")
 
             run_markers = (frame_count % MARKER_RECHECK_EVERY_N_FRAMES == 0)
 

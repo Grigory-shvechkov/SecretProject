@@ -46,36 +46,43 @@ class Camera:
         self._stopped = False
         self._thread = None
 
-        self.cap = self._open_with_timeout(index, OPEN_TIMEOUT_SECONDS)
+        self.cap = self._open_with_timeout(index, width, height, OPEN_TIMEOUT_SECONDS)
         if self.cap is None:
             # Don't crash the whole pipeline over one missing/unplugged/
             # hung camera -- print why and leave self.cap as None so
             # read() just reports "no frame" forever, same as a dropped
             # frame.
             print(f"Warning: Camera {index} could not be opened (or hung "
-                  f"opening past {OPEN_TIMEOUT_SECONDS:.0f}s). Continuing "
-                  f"without it -- frames from it will be None.")
+                  f"opening/configuring past {OPEN_TIMEOUT_SECONDS:.0f}s). "
+                  f"Continuing without it -- frames from it will be None.")
             return
-
-        self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
-        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
-        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
 
         self._thread = threading.Thread(target=self._reader_loop, daemon=True)
         self._thread.start()
 
-    def _open_with_timeout(self, index, timeout):
-        """Run cv2.VideoCapture(...) on a daemon thread and join with a
-        timeout, so a hung open() can't hang __init__ (and therefore the
-        whole app) -- same rationale as the reader thread. If it never
-        finishes, the thread is simply abandoned (daemon=True keeps it
-        from blocking process exit); we treat this camera as unavailable
-        rather than wait indefinitely.
+    def _open_with_timeout(self, index, width, height, timeout):
+        """Run cv2.VideoCapture(...) AND the .set(...) calls that configure
+        it on a daemon thread, joined with a timeout, so a hang anywhere
+        in opening/configuring can't hang __init__ (and therefore the
+        whole app) -- same rationale as the reader thread. The .set()
+        calls have to live inside this same guarded thread, not after it:
+        a V4L2 node that opens fine (isOpened() True) but then hangs on
+        one of these ioctls -- e.g. the metadata-only node described in
+        run.py's comment -- would otherwise still freeze __init__ even
+        though the open() itself was already timeout-guarded. If nothing
+        finishes in time, the thread is simply abandoned (daemon=True
+        keeps it from blocking process exit); we treat this camera as
+        unavailable rather than wait indefinitely.
         """
         result = {}
 
         def _open():
-            result["cap"] = cv2.VideoCapture(index, _BACKEND)
+            cap = cv2.VideoCapture(index, _BACKEND)
+            if cap.isOpened():
+                cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+                cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+                cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+            result["cap"] = cap
 
         opener = threading.Thread(target=_open, daemon=True)
         opener.start()
