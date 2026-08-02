@@ -3,7 +3,24 @@
 # OpenEXR -- there's no matching prebuilt wheel for this platform/Python
 # combo. Install it via apt instead, which ships a precompiled binary:
 #     sudo apt install -y python3-opencv
-numpy
+#
+# numpy's piwheels wheel is built against OpenBLAS and expects
+# libopenblas.so.0 to already exist on the system -- pip installing numpy
+# succeeds, but `import numpy` (or anything that imports it, e.g. cv2)
+# then fails with "ImportError: libopenblas.so.0: cannot open shared
+# object file". Also an apt package, also install it before relying on
+# this file:
+#     sudo apt install -y libopenblas0
+#
+# Pinned to <2 (numpy==1.26.4, the last 1.x release, confirmed to have a
+# cp39-armv7l wheel on piwheels) because NumPy 2.x broke C-API/ABI
+# compatibility with anything compiled against NumPy 1.x -- including
+# this Pi's apt-installed python3-opencv, which was built against a 1.x
+# numpy. Installing numpy 2.x (what pip picks by default, unpinned) makes
+# `import cv2` fail with "AttributeError: _ARRAY_API not found" even
+# though numpy itself imports fine on its own. If python3-opencv is ever
+# rebuilt/upgraded against NumPy 2.x, this pin can be dropped.
+numpy==1.26.4
 requests
 
 # Fish detection runs on TensorFlow Lite, not PyTorch/ultralytics.
