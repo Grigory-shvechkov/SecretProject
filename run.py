@@ -17,7 +17,12 @@ What it does, in order, every time you run it:
        off-center or at a slight angle, not perfectly square-on.
     4. Loops forever: finds the fish with FishDetector (TensorFlow Lite)
        in both cameras, combines the two views into one 3D (X, Y, Z)
-       position, and POSTs it to the feed-fish API.
+       position, and POSTs it to the feed-fish API. Every
+       MARKER_RECHECK_INTERVAL_SECONDS, it also re-detects the markers
+       and rebuilds the mapping from whatever's currently found -- so if
+       the tank or a camera gets bumped/moved after startup, tracking
+       re-calibrates on its own instead of staying wrong for the rest of
+       the run.
 
 The only setup this needs: measure your tank and set TANK_SIZE_CM below,
 and physically stick EXPECTED_MARKERS yellow markers (stickers/tape/
@@ -88,6 +93,24 @@ MARKER_LOWER = (20, 60, 40)
 MARKER_UPPER = (35, 255, 255)
 EXPECTED_MARKERS = 4
 CORNER_DETECT_TIMEOUT_SECONDS = 30.0
+
+# After initial calibration, re-detect the markers every this many
+# seconds (using the frame the loop already read this tick -- no extra
+# camera I/O) and rebuild the coordinate mapping from whatever's found.
+# Keeps tracking accurate if the tank or a camera gets physically moved/
+# bumped after startup, instead of trusting the very first calibration
+# for the rest of the run. Only a FULL set of EXPECTED_MARKERS is ever
+# accepted (same rule as the initial calibration in _find_corners) -- a
+# partial read (one marker briefly occluded) just keeps the last known-
+# good corners rather than corrupting the mapping.
+MARKER_RECHECK_INTERVAL_SECONDS = 5.0
+
+# Average per-corner pixel movement, between the last accepted quad and
+# a freshly recomputed one, before it's treated as "the tank actually
+# moved" and printed. The mapping gets refreshed every recheck either
+# way -- this threshold is only about avoiding a print every 5s over
+# ordinary marker-detection jitter when nothing has changed.
+MARKER_MOVED_THRESHOLD_PX = 8.0
 
 API_URL = "https://feed-fish.onrender.com/newPos"
 REQUEST_TIMEOUT_SECONDS = 5.0
@@ -208,6 +231,28 @@ def _find_corners(cam, label, debug=False):
         f"Vision/color_test.py to verify MARKER_LOWER/MARKER_UPPER against your camera.")
 
 
+def _recheck_corners(marker_detector, frame):
+    """Look for EXPECTED_MARKERS in one already-captured frame (no camera
+    I/O of its own). Returns the ordered quad if a full set is found,
+    else None -- caller should just keep the last known-good corners on
+    None, the same "only trust a full set" rule _find_corners uses."""
+    centers, _ = marker_detector.detect(frame)
+    if len(centers) < EXPECTED_MARKERS:
+        return None
+    return order_quad_points(centers[:EXPECTED_MARKERS])
+
+
+def _quad_moved(old_corners, new_corners):
+    """True if new_corners is more than MARKER_MOVED_THRESHOLD_PX (average
+    per-corner distance) away from old_corners -- i.e. worth telling the
+    user about, vs. ordinary frame-to-frame marker-detection jitter."""
+    dists = [
+        ((ox - nx) ** 2 + (oy - ny) ** 2) ** 0.5
+        for (ox, oy), (nx, ny) in zip(old_corners, new_corners)
+    ]
+    return (sum(dists) / len(dists)) > MARKER_MOVED_THRESHOLD_PX
+
+
 def send_position(position, verbose=False):
     """POST a position dict like {'x': .., 'y': .., 'z': ..} to the API.
 
@@ -262,7 +307,9 @@ def main(debug=False, verbose=False, no_detect=False):
                 detector_side = FishDetector(model_path=FISH_MODEL_PATH, labels_path=FISH_LABELS_PATH,
                                               conf=FISH_CONF_THRESHOLD)
 
+            marker_detector = ColorMarkerDetector(MARKER_LOWER, MARKER_UPPER)
             last_sent = 0.0
+            last_marker_check = time.monotonic()
 
             while True:
                 front_frame = front_cam.read()
@@ -273,6 +320,20 @@ def main(debug=False, verbose=False, no_detect=False):
                         print("Dropped frame, skipping this tick.")
                     time.sleep(IDLE_POLL_SECONDS)
                     continue
+
+                now = time.monotonic()
+                if now - last_marker_check >= MARKER_RECHECK_INTERVAL_SECONDS:
+                    last_marker_check = now
+                    new_front = _recheck_corners(marker_detector, front_frame)
+                    new_side = _recheck_corners(marker_detector, side_frame)
+                    if new_front is not None and new_side is not None:
+                        moved = _quad_moved(front_corners, new_front) or _quad_moved(side_corners, new_side)
+                        front_corners, side_corners = new_front, new_side
+                        mapper = CoordinateMapper(front_corners, side_corners, TANK_SIZE_CM)
+                        if moved:
+                            print("Tank markers moved -- recalibrated.")
+                    elif verbose:
+                        print("Marker recheck: not all markers visible, keeping last known calibration.")
 
                 if no_detect:
                     front_detections, side_detections = [], []
