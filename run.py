@@ -60,6 +60,7 @@ import argparse
 import os
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 VISION_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "Vision")
 sys.path.insert(0, VISION_DIR)
@@ -282,6 +283,8 @@ def main(debug=False, verbose=False, no_detect=False):
     if no_detect:
         print("--no-detect: fish detection is OFF -- camera feed and tank outline only, "
               "nothing will ever be tracked/sent while this is on.")
+    detect_pool = None  # bound here so `finally` below can always reference it,
+                         # even on the early-return calibration-timeout path
     try:
         with Camera(FRONT_CAMERA_INDEX) as front_cam, Camera(SIDE_CAMERA_INDEX) as side_cam:
             print(f"Looking for {EXPECTED_MARKERS} yellow corner markers on each camera...")
@@ -302,12 +305,24 @@ def main(debug=False, verbose=False, no_detect=False):
             if no_detect:
                 detector_front = detector_side = None
             else:
+                # front and side run CONCURRENTLY (see detect_pool below),
+                # so each interpreter only gets HALF the cores -- asking
+                # for all 4 each would oversubscribe the Pi 4's 4 physical
+                # cores the moment both are actually inferring at once.
+                per_detector_threads = max(1, (os.cpu_count() or 4) // 2)
                 detector_front = FishDetector(model_path=FISH_MODEL_PATH, labels_path=FISH_LABELS_PATH,
-                                               conf=FISH_CONF_THRESHOLD)
+                                               conf=FISH_CONF_THRESHOLD, num_threads=per_detector_threads)
                 detector_side = FishDetector(model_path=FISH_MODEL_PATH, labels_path=FISH_LABELS_PATH,
-                                              conf=FISH_CONF_THRESHOLD)
+                                              conf=FISH_CONF_THRESHOLD, num_threads=per_detector_threads)
 
             marker_detector = ColorMarkerDetector(MARKER_LOWER, MARKER_UPPER)
+            # 2 workers: front's and side's detect() calls run at the same
+            # time on separate threads instead of back-to-back -- see the
+            # per_detector_threads split above for why that's safe rather
+            # than oversubscribing the Pi's cores. One pool, created once
+            # and reused every tick, rather than spinning up new threads
+            # per tick.
+            detect_pool = ThreadPoolExecutor(max_workers=2) if not no_detect else None
             last_sent = 0.0
             last_marker_check = time.monotonic()
 
@@ -338,8 +353,10 @@ def main(debug=False, verbose=False, no_detect=False):
                 if no_detect:
                     front_detections, side_detections = [], []
                 else:
-                    front_detections, _ = detector_front.detect(front_frame)
-                    side_detections, _ = detector_side.detect(side_frame)
+                    front_future = detect_pool.submit(detector_front.detect, front_frame)
+                    side_future = detect_pool.submit(detector_side.detect, side_frame)
+                    front_detections, _ = front_future.result()
+                    side_detections, _ = side_future.result()
 
                 if debug:
                     front_view = front_frame.copy()
@@ -389,6 +406,8 @@ def main(debug=False, verbose=False, no_detect=False):
     finally:
         if debug:
             cv2.destroyAllWindows()
+        if detect_pool is not None:
+            detect_pool.shutdown(wait=False)
 
 
 if __name__ == "__main__":
