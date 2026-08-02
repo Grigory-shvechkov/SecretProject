@@ -6,22 +6,17 @@
 numpy
 requests
 
-# ultralytics (YOLO, used by Vision/detection.py's FishDetector) is
-# deliberately NOT listed here either, same reasoning as opencv-python
-# above plus one more failure mode: pip's resolver tries to satisfy
-# ultralytics's own pinned dependencies (opencv-python, numpy, etc.)
-# against what's already installed, can't, and "fixes" that by
-# backtracking through every past ultralytics release one at a time
-# looking for a combination that resolves -- this can churn for a very
-# long time (or never finish) instead of just failing fast.
+# ultralytics (YOLO, used by Vision/detection.py's FishDetector) and its
+# own dependencies (torch, etc.) are deliberately NOT listed here either,
+# same reasoning as opencv-python above plus one more failure mode: pip's
+# resolver trying to satisfy ultralytics's pinned dependencies against
+# what's already installed can fall into backtracking through every past
+# ultralytics release one at a time looking for a combination that
+# resolves -- this can churn for a very long time instead of just failing
+# fast. See requirements-ml.txt (install with --no-deps) for that stack.
 #
-# Install it on its own, with dependency resolution skipped entirely, so
-# pip never gets a chance to start that backtracking search:
-#     pip install --no-deps ultralytics
-#     python3 -c "from ultralytics import YOLO"
-# The second command will ImportError on whatever ultralytics actually
-# still needs (torch, torchvision, pyyaml, pillow, tqdm, matplotlib,
-# pandas, psutil, py-cpuinfo, scipy, ultralytics-thop, as of this
-# writing) -- pip install each one it names, re-running the check until
-# it passes. torch/torchvision in particular usually need a Pi-specific
-# wheel from https://www.piwheels.org rather than plain PyPI.
+# torch/torchvision in particular usually need a Pi-specific wheel from
+# https://www.piwheels.org rather than plain PyPI -- if pip can't find a
+# wheel at all for this Pi's architecture/Python version, that's a piwheels
+# coverage gap, not a resolver problem, and needs a different fix (e.g. an
+# older torch release, or building from source).
