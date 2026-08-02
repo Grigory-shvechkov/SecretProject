@@ -29,16 +29,21 @@ troubleshooting tools -- e.g. if markers aren't being found, color_test.py
 helps you pick a better HSV range for your actual camera/lighting -- but
 neither is a required step. This script alone is the whole pipeline.)
 
-Pass --debug to also open a live window per camera (FRONT/SIDE) showing
-whatever's currently detected drawn on top of that camera's feed (corner
-markers while calibrating; the calibrated tank outline + fish detection
-boxes once tracking) -- everything this script is doing, made visible,
-instead of just the console prints. Needs an actual display (local
-monitor, or VNC/X11-forwarded SSH) -- a plain headless SSH session can't
-show it. Press 'q' in either window (or Ctrl+C in the terminal, same as
-always) to stop:
+Pass --debug to also open a live window (both cameras side by side, one
+window total) showing whatever's currently detected drawn on top of the
+feed -- corner markers while calibrating, the calibrated tank outline +
+fish detection boxes once tracking -- everything this script is doing,
+made visible, instead of just the console prints. Needs an actual
+display (local monitor, or VNC/X11-forwarded SSH) -- a plain headless
+SSH session can't show it. Press 'q' in the window (or Ctrl+C in the
+terminal, same as always) to stop.
 
-    python run.py --debug
+By default the console stays quiet during normal operation -- only
+startup/calibration messages, request failures, and the stop message
+print. Pass -v/--verbose to also print every tick's outcome (position
+sent, frame dropped, object not visible, etc.):
+
+    python run.py --debug -v
 """
 
 import argparse
@@ -126,20 +131,27 @@ def _draw_quad(frame, corners):
     cv2.polylines(frame, [pts], isClosed=True, color=(0, 255, 0), thickness=2)
 
 
-def _show_debug_frame(camera_label, frame, status=""):
-    """Resize and show one camera's frame in its own window. camera_label
-    ("FRONT"/"SIDE") is used as the window's identity and stays fixed
-    across both the calibration and tracking phases, so the SAME window
-    keeps getting updated as the script moves from one phase to the
-    other -- rather than each phase opening its own differently-named
-    window and leaving the previous phase's window behind, frozen on its
-    last frame. `status` is just an extra text overlay (e.g.
-    "calibrating") drawn onto the frame, free to change between calls.
-    Returns True if 'q' was pressed (caller should stop), else False."""
+def _labeled_view(label, frame):
+    """Resize one camera's frame to debug size and caption it. Pure image
+    prep -- does NOT touch any window, so it's safe to call once per
+    camera even though only one shared window ever gets shown per tick."""
     view = cv2.resize(frame, (DEBUG_DISPLAY_W, DEBUG_DISPLAY_H))
-    caption = f"{camera_label} {status}".strip()
-    cv2.putText(view, caption, (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-    cv2.imshow(f"{DEBUG_WINDOW_NAME} - {camera_label}", view)
+    cv2.putText(view, label, (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+    return view
+
+
+def _show_debug_frame(image):
+    """Show one image in the SINGLE shared debug window and check for the
+    quit key. Deliberately just one persistent window for the entire run
+    (calibration AND tracking), with exactly one cv2.imshow()/waitKey()
+    call per tick -- an earlier version of this opened a separate native
+    window per camera and called waitKey() twice per tick, which rendered
+    incorrectly (stale/garbled content bleeding through, like a leftover
+    copy of the terminal) over a remote X11/VNC display. One window,
+    called once per tick, is the same pattern Vision/debug_view.py
+    already uses without that problem.
+    Returns True if 'q' was pressed (caller should stop), else False."""
+    cv2.imshow(DEBUG_WINDOW_NAME, image)
     return (cv2.waitKey(1) & 0xFF) == ord('q')
 
 
@@ -165,7 +177,8 @@ def _find_corners(cam, label, debug=False):
                 last_count = len(centers)
             if debug:
                 view = detector.draw(frame.copy(), centers)
-                if _show_debug_frame(label, view, status="(calibrating)"):
+                view = _labeled_view(f"{label} (calibrating)", view)
+                if _show_debug_frame(view):
                     raise KeyboardInterrupt
             if len(centers) >= EXPECTED_MARKERS:
                 return order_quad_points(centers[:EXPECTED_MARKERS])
@@ -176,8 +189,15 @@ def _find_corners(cam, label, debug=False):
         f"Vision/color_test.py to verify MARKER_LOWER/MARKER_UPPER against your camera.")
 
 
-def send_position(position):
-    """POST a position dict like {'x': .., 'y': .., 'z': ..} to the API."""
+def send_position(position, verbose=False):
+    """POST a position dict like {'x': .., 'y': .., 'z': ..} to the API.
+
+    The success line is only printed when verbose -- it fires every
+    SEND_INTERVAL_SECONDS while a fish is visible, so left unconditional
+    it dominates the console. Failures print regardless of verbose: a
+    silent-by-default run shouldn't also hide the one message that means
+    something is actually broken.
+    """
     try:
         response = requests.post(
             API_URL,
@@ -186,12 +206,13 @@ def send_position(position):
             timeout=REQUEST_TIMEOUT_SECONDS,
         )
         response.raise_for_status()
-        print(f"Sent {position} -> {response.status_code} {response.json()}")
+        if verbose:
+            print(f"Sent {position} -> {response.status_code} {response.json()}")
     except requests.exceptions.RequestException as error:
         print(f"Request failed for {position}: {error}")
 
 
-def main(debug=False):
+def main(debug=False, verbose=False):
     print("Starting vision pipeline. Press Ctrl+C to stop." +
           (" (or 'q' in the debug window)" if debug else ""))
     try:
@@ -217,7 +238,8 @@ def main(debug=False):
                 side_frame = side_cam.read()
 
                 if front_frame is None or side_frame is None:
-                    print("Dropped frame, skipping this tick.")
+                    if verbose:
+                        print("Dropped frame, skipping this tick.")
                     time.sleep(SEND_INTERVAL_SECONDS)
                     continue
 
@@ -229,26 +251,28 @@ def main(debug=False):
                     side_view = detector_side.draw(side_frame.copy(), side_detections)
                     _draw_quad(front_view, front_corners)
                     _draw_quad(side_view, side_corners)
-                    quit_front = _show_debug_frame("FRONT", front_view)
-                    quit_side = _show_debug_frame("SIDE", side_view)
-                    if quit_front or quit_side:
+                    front_view = _labeled_view("FRONT", front_view)
+                    side_view = _labeled_view("SIDE", side_view)
+                    if _show_debug_frame(np.hstack([front_view, side_view])):
                         raise KeyboardInterrupt
 
                 front_result = _best_center(front_detections)
                 side_result = _best_center(side_detections)
 
                 if front_result is None or side_result is None:
-                    print("Object not visible in both cameras, skipping this tick.")
+                    if verbose:
+                        print("Object not visible in both cameras, skipping this tick.")
                     time.sleep(SEND_INTERVAL_SECONDS)
                     continue
 
                 position_cm, y_diff = mapper.combine(front_result, side_result)
                 if not mapper.in_tank(position_cm):
-                    print(f"Detected position {position_cm}cm is outside the tank, skipping.")
+                    if verbose:
+                        print(f"Detected position {position_cm}cm is outside the tank, skipping.")
                     time.sleep(SEND_INTERVAL_SECONDS)
                     continue
 
-                if y_diff > 3.0:
+                if y_diff > 3.0 and verbose:
                     print(f"Warning: front/side cameras disagree on height by {y_diff}cm")
 
                 x_cm, y_cm, z_cm = position_cm
@@ -256,7 +280,7 @@ def main(debug=False):
                     "x": round(x_cm * CM_TO_INCHES, 2),
                     "y": round(y_cm * CM_TO_INCHES, 2),
                     "z": round(z_cm * CM_TO_INCHES, 2),
-                })
+                }, verbose=verbose)
 
                 time.sleep(SEND_INTERVAL_SECONDS)
     except KeyboardInterrupt:
@@ -269,9 +293,13 @@ def main(debug=False):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Fish tank vision pipeline.")
     parser.add_argument("--debug", action="store_true",
-                         help="also open a live window per camera showing whatever's currently "
-                              "detected (corner markers while calibrating; the calibrated tank "
-                              "outline + fish detection boxes once tracking). Needs a real "
-                              "display (local monitor or VNC/X11-forwarded SSH).")
+                         help="also open a live window showing whatever's currently detected "
+                              "(corner markers while calibrating; the calibrated tank outline + "
+                              "fish detection boxes once tracking). Needs a real display (local "
+                              "monitor or VNC/X11-forwarded SSH).")
+    parser.add_argument("-v", "--verbose", action="store_true",
+                         help="print per-tick status (every position sent, every skipped frame) "
+                              "instead of running quietly. Without this, only startup/calibration "
+                              "messages, request failures, and Ctrl+C/quit print anything.")
     args = parser.parse_args()
-    main(debug=args.debug)
+    main(debug=args.debug, verbose=args.verbose)
