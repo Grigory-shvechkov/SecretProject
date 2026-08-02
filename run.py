@@ -41,9 +41,14 @@ terminal, same as always) to stop.
 By default the console stays quiet during normal operation -- only
 startup/calibration messages, request failures, and the stop message
 print. Pass -v/--verbose to also print every tick's outcome (position
-sent, frame dropped, object not visible, etc.):
+sent, frame dropped, object not visible, etc.).
 
-    python run.py --debug -v
+Pass --no-detect to skip loading/running FishDetector entirely (camera
+feed + calibrated tank outline only, with --debug -- nothing is ever
+tracked/sent). Useful for telling apart "TFLite inference is slow" from
+"the debug window itself is slow":
+
+    python run.py --debug --no-detect
 """
 
 import argparse
@@ -212,9 +217,12 @@ def send_position(position, verbose=False):
         print(f"Request failed for {position}: {error}")
 
 
-def main(debug=False, verbose=False):
+def main(debug=False, verbose=False, no_detect=False):
     print("Starting vision pipeline. Press Ctrl+C to stop." +
           (" (or 'q' in the debug window)" if debug else ""))
+    if no_detect:
+        print("--no-detect: fish detection is OFF -- camera feed and tank outline only, "
+              "nothing will ever be tracked/sent while this is on.")
     try:
         with Camera(FRONT_CAMERA_INDEX) as front_cam, Camera(SIDE_CAMERA_INDEX) as side_cam:
             print(f"Looking for {EXPECTED_MARKERS} yellow corner markers on each camera...")
@@ -228,10 +236,17 @@ def main(debug=False, verbose=False):
             mapper = CoordinateMapper(front_corners, side_corners, TANK_SIZE_CM)
             print("Calibrated. Starting fish tracking.")
 
-            detector_front = FishDetector(model_path=FISH_MODEL_PATH, labels_path=FISH_LABELS_PATH,
-                                           conf=FISH_CONF_THRESHOLD)
-            detector_side = FishDetector(model_path=FISH_MODEL_PATH, labels_path=FISH_LABELS_PATH,
-                                          conf=FISH_CONF_THRESHOLD)
+            # Skip even LOADING the model when no_detect -- not just
+            # skipping the per-frame detect() calls -- so this mode has
+            # zero TFLite cost at all, for isolating whether inference or
+            # the debug window itself is the actual bottleneck.
+            if no_detect:
+                detector_front = detector_side = None
+            else:
+                detector_front = FishDetector(model_path=FISH_MODEL_PATH, labels_path=FISH_LABELS_PATH,
+                                               conf=FISH_CONF_THRESHOLD)
+                detector_side = FishDetector(model_path=FISH_MODEL_PATH, labels_path=FISH_LABELS_PATH,
+                                              conf=FISH_CONF_THRESHOLD)
 
             while True:
                 front_frame = front_cam.read()
@@ -243,12 +258,18 @@ def main(debug=False, verbose=False):
                     time.sleep(SEND_INTERVAL_SECONDS)
                     continue
 
-                front_detections, _ = detector_front.detect(front_frame)
-                side_detections, _ = detector_side.detect(side_frame)
+                if no_detect:
+                    front_detections, side_detections = [], []
+                else:
+                    front_detections, _ = detector_front.detect(front_frame)
+                    side_detections, _ = detector_side.detect(side_frame)
 
                 if debug:
-                    front_view = detector_front.draw(front_frame.copy(), front_detections)
-                    side_view = detector_side.draw(side_frame.copy(), side_detections)
+                    front_view = front_frame.copy()
+                    side_view = side_frame.copy()
+                    if not no_detect:
+                        front_view = detector_front.draw(front_view, front_detections)
+                        side_view = detector_side.draw(side_view, side_detections)
                     _draw_quad(front_view, front_corners)
                     _draw_quad(side_view, side_corners)
                     front_view = _labeled_view("FRONT", front_view)
@@ -301,5 +322,10 @@ if __name__ == "__main__":
                          help="print per-tick status (every position sent, every skipped frame) "
                               "instead of running quietly. Without this, only startup/calibration "
                               "messages, request failures, and Ctrl+C/quit print anything.")
+    parser.add_argument("--no-detect", action="store_true",
+                         help="skip loading/running FishDetector entirely -- camera feed and "
+                              "calibrated tank outline still show (with --debug), but nothing is "
+                              "ever detected/tracked/sent. For isolating whether TFLite inference "
+                              "or the debug window itself is a performance problem.")
     args = parser.parse_args()
-    main(debug=args.debug, verbose=args.verbose)
+    main(debug=args.debug, verbose=args.verbose, no_detect=args.no_detect)

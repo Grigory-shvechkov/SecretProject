@@ -287,11 +287,16 @@ class FishDetector:
         """Draw every detection's box + label onto frame IN PLACE (same
         contract as RedBallDetector/ColorMarkerDetector's draw() -- unlike
         the old ultralytics-backed version, which had to return a FRESH
-        image via raw.plot() instead). Returns the frame."""
+        image via raw.plot() instead). Returns the frame.
+
+        Red, deliberately NOT the same green run.py's _draw_quad() uses
+        for the calibrated tank outline -- both get drawn onto the same
+        debug frame, and two different things in the same color there
+        would be indistinguishable."""
         for name, score, (x1, y1, x2, y2) in detections:
-            cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+            cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 0, 255), 2)
             cv2.putText(frame, f"{name} {score:.2f}", (x1, max(0, y1 - 8)),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
         return frame
 
     @staticmethod
