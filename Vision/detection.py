@@ -30,6 +30,8 @@ or open windows. Drawing is a separate draw() method. This keeps detectors
 reusable by run.py and coordinate_mapper.py alike.
 """
 
+import os
+
 import cv2
 import numpy as np
 
@@ -221,10 +223,17 @@ class FishDetector:
       would need detect() below adjusted to match.
     """
 
-    def __init__(self, model_path, labels_path, conf=0.4):
+    def __init__(self, model_path, labels_path, conf=0.4, num_threads=None):
         from tflite_runtime.interpreter import Interpreter
 
-        self.interpreter = Interpreter(model_path=model_path)
+        # Interpreter defaults to single-threaded inference, which wastes
+        # 3 of the Pi 4's 4 cores. os.cpu_count() picks up all of them
+        # automatically; pass an explicit number to leave headroom for
+        # everything else this script is also doing (camera reads, the
+        # debug window) if inference ends up starving them.
+        if num_threads is None:
+            num_threads = os.cpu_count() or 4
+        self.interpreter = Interpreter(model_path=model_path, num_threads=num_threads)
         self.interpreter.allocate_tensors()
         self._input_details = self.interpreter.get_input_details()
         self._output_details = self.interpreter.get_output_details()

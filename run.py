@@ -91,7 +91,21 @@ CORNER_DETECT_TIMEOUT_SECONDS = 30.0
 
 API_URL = "https://feed-fish.onrender.com/newPos"
 REQUEST_TIMEOUT_SECONDS = 5.0
+# Governs ONLY how often a position is actually POSTed to the API -- NOT
+# the main loop's pace. It used to be a blanket time.sleep() at the end
+# of every loop iteration, which meant the --debug window (and detection
+# itself) could never update faster than the API's own throttle. Now the
+# loop runs flat-out (camera read + detection + debug display, every
+# tick, as fast as the hardware allows) and this just gates send_position
+# calls via a last-sent timestamp -- see main().
 SEND_INTERVAL_SECONDS = 0.5
+
+# Loop-pacing sleep for the ONE case where there's genuinely nothing to
+# do yet (both cameras returned no frame) -- avoids pegging a CPU core
+# busy-polling cam.read() in a tight spin. Deliberately much shorter than
+# SEND_INTERVAL_SECONDS, which is an API-traffic decision, not a "how
+# idle can we afford to be" one.
+IDLE_POLL_SECONDS = 0.05
 
 CM_TO_INCHES = 1 / 2.54
 
@@ -248,6 +262,8 @@ def main(debug=False, verbose=False, no_detect=False):
                 detector_side = FishDetector(model_path=FISH_MODEL_PATH, labels_path=FISH_LABELS_PATH,
                                               conf=FISH_CONF_THRESHOLD)
 
+            last_sent = 0.0
+
             while True:
                 front_frame = front_cam.read()
                 side_frame = side_cam.read()
@@ -255,7 +271,7 @@ def main(debug=False, verbose=False, no_detect=False):
                 if front_frame is None or side_frame is None:
                     if verbose:
                         print("Dropped frame, skipping this tick.")
-                    time.sleep(SEND_INTERVAL_SECONDS)
+                    time.sleep(IDLE_POLL_SECONDS)
                     continue
 
                 if no_detect:
@@ -283,27 +299,30 @@ def main(debug=False, verbose=False, no_detect=False):
                 if front_result is None or side_result is None:
                     if verbose:
                         print("Object not visible in both cameras, skipping this tick.")
-                    time.sleep(SEND_INTERVAL_SECONDS)
                     continue
 
                 position_cm, y_diff = mapper.combine(front_result, side_result)
                 if not mapper.in_tank(position_cm):
                     if verbose:
                         print(f"Detected position {position_cm}cm is outside the tank, skipping.")
-                    time.sleep(SEND_INTERVAL_SECONDS)
                     continue
 
                 if y_diff > 3.0 and verbose:
                     print(f"Warning: front/side cameras disagree on height by {y_diff}cm")
 
-                x_cm, y_cm, z_cm = position_cm
-                send_position({
-                    "x": round(x_cm * CM_TO_INCHES, 2),
-                    "y": round(y_cm * CM_TO_INCHES, 2),
-                    "z": round(z_cm * CM_TO_INCHES, 2),
-                }, verbose=verbose)
-
-                time.sleep(SEND_INTERVAL_SECONDS)
+                # Rate-limit the actual POST to SEND_INTERVAL_SECONDS,
+                # independent of how fast the loop above is running --
+                # the loop itself no longer sleeps at all here, so
+                # detection/debug-display cadence is unaffected by this.
+                now = time.monotonic()
+                if now - last_sent >= SEND_INTERVAL_SECONDS:
+                    x_cm, y_cm, z_cm = position_cm
+                    send_position({
+                        "x": round(x_cm * CM_TO_INCHES, 2),
+                        "y": round(y_cm * CM_TO_INCHES, 2),
+                        "z": round(z_cm * CM_TO_INCHES, 2),
+                    }, verbose=verbose)
+                    last_sent = now
     except KeyboardInterrupt:
         print("\nStopped by user.")
     finally:
