@@ -11,17 +11,22 @@ requests
 # PyTorch has never published wheels for 32-bit ARM (armv7l), at any
 # version, on PyPI or piwheels.
 #
-# tflite-runtime 2.14.0 does publish an official cp39-armv7l wheel on
-# PyPI, which is why it's pinned to that exact version here rather than
-# left open -- an unpinned version could resolve to a future release
-# without an armv7l wheel and send pip into the same backtracking search
-# that plain `ultralytics` triggered.
+# Pinned to 2.13.0 specifically, not the latest (2.14.0) -- confirmed by
+# checking PyPI's file listing per-release:
+#   * 2.14.0 only ships a manylinux_2_34_armv7l wheel, which needs glibc
+#     >=2.34 (Debian Bookworm+). This Pi is on Bullseye (glibc 2.31), so
+#     pip rejected it as incompatible even though the Python version and
+#     architecture both matched -- confirmed by actually trying it.
+#   * 2.13.0 (and 2.7.0-2.13.0 generally) ships a
+#     manylinux2014_armv7l wheel instead, which only needs glibc >=2.17 --
+#     comfortably covers Bullseye. This is the newest release that still
+#     has that looser tag.
+# Left unpinned, pip would default to 2.14.0 and fail the same way again
+# (or worse, backtrack through releases the way plain `ultralytics` did,
+# looking for one that resolves) -- pinning avoids both.
 #
-# One remaining risk, unconfirmed as of this file: that wheel's platform
-# tag is manylinux_2_34, which needs glibc >=2.34 (Debian Bookworm+). If
-# this Pi is still on Bullseye (glibc 2.31), pip will reject it as
-# incompatible even though the Python version/architecture match. If
-# that happens: either upgrade this Pi to Bookworm, or fall back to
+# If this Pi is ever upgraded to Bookworm or later, 2.14.0+ should work
+# and can be tried again. Fallback if 2.13.0 somehow doesn't install:
 # onnxruntime (see github.com/nknytk/built-onnxruntime-for-raspberrypi-linux
 # for an armv7l-compatible build) instead of tflite-runtime.
-tflite-runtime==2.14.0
+tflite-runtime==2.13.0
