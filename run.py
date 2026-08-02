@@ -15,9 +15,9 @@ What it does, in order, every time you run it:
     3. Builds a rotation-correct pixel -> cm mapping from those corners
        plus TANK_SIZE_CM below -- correct even if a camera is mounted
        off-center or at a slight angle, not perfectly square-on.
-    4. Loops forever: finds the fish with FishDetector (YOLO) in both
-       cameras, combines the two views into one 3D (X, Y, Z) position,
-       and POSTs it to the feed-fish API.
+    4. Loops forever: finds the fish with FishDetector (TensorFlow Lite)
+       in both cameras, combines the two views into one 3D (X, Y, Z)
+       position, and POSTs it to the feed-fish API.
 
 The only setup this needs: measure your tank and set TANK_SIZE_CM below,
 and physically stick EXPECTED_MARKERS yellow markers (stickers/tape/
@@ -71,18 +71,24 @@ SEND_INTERVAL_SECONDS = 0.5
 
 CM_TO_INCHES = 1 / 2.54
 
-# Stock yolov8n.pt has NO fish class (see detection.py's FishDetector
-# docstring) -- fine to confirm the pipeline runs, useless for real fish
-# tracking until pointed at fish-trained weights. Expect ~1-3s/frame on a
-# Pi 3, vs. near-instant for the marker color filtering above.
-FISH_MODEL_PATH = "yolov8n.pt"
+# FishDetector needs an actual .tflite model + labelmap.txt -- unlike the
+# old ultralytics YOLO() call, tflite-runtime has no auto-download. Put
+# both files in Vision/models/ (create the folder). A stock COCO-trained
+# model (e.g. the classic "detect.tflite" + "labelmap.txt" pair from
+# TensorFlow's object detection examples) proves the pipeline runs but
+# has NO fish class -- same caveat the old stock yolov8n.pt had. Point
+# these at fish-trained weights, converted to .tflite, for real fish
+# detection. See detection.py's FishDetector docstring for the output-
+# tensor-format assumption this relies on.
+FISH_MODEL_PATH = os.path.join(VISION_DIR, "models", "detect.tflite")
+FISH_LABELS_PATH = os.path.join(VISION_DIR, "models", "labelmap.txt")
 FISH_CONF_THRESHOLD = 0.4
 
 
 def _best_center(detections):
-    """Pick the highest-confidence YOLO detection this tick and convert it
-    to the (cx, cy, half) shape CoordinateMapper.combine() expects. None
-    if nothing was detected."""
+    """Pick the highest-confidence detection this tick and convert it to
+    the (cx, cy, half) shape CoordinateMapper.combine() expects. None if
+    nothing was detected."""
     if not detections:
         return None
     best = max(detections, key=lambda d: d[1])
@@ -148,8 +154,10 @@ def main():
             mapper = CoordinateMapper(front_corners, side_corners, TANK_SIZE_CM)
             print("Calibrated. Starting fish tracking.")
 
-            detector_front = FishDetector(model_path=FISH_MODEL_PATH, conf=FISH_CONF_THRESHOLD)
-            detector_side = FishDetector(model_path=FISH_MODEL_PATH, conf=FISH_CONF_THRESHOLD)
+            detector_front = FishDetector(model_path=FISH_MODEL_PATH, labels_path=FISH_LABELS_PATH,
+                                           conf=FISH_CONF_THRESHOLD)
+            detector_side = FishDetector(model_path=FISH_MODEL_PATH, labels_path=FISH_LABELS_PATH,
+                                          conf=FISH_CONF_THRESHOLD)
 
             while True:
                 front_frame = front_cam.read()

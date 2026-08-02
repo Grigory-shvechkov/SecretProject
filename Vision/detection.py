@@ -14,12 +14,16 @@ Three detectors live here:
                         automatic tank-bounds calibration -- see
                         coordinate_mapper.py's marker calibration mode.
 
-  FishDetector       -- AI detector. Runs a YOLO neural network. Slow on a
-                        Pi 3 (~1-3 s per frame) but knows actual object
-                        classes. Pass fish-trained weights via model_path
-                        for real fish detection (stock yolov8n.pt has NO
+  FishDetector       -- AI detector. Runs a TensorFlow Lite neural network
+                        (tflite-runtime) -- fast enough for real-time on a
+                        Pi 4 (tens of ms/frame) and knows actual object
+                        classes, unlike the color detectors above. Pass a
+                        fish-trained .tflite model via model_path for real
+                        fish detection (a stock COCO-trained model has NO
                         fish class -- it is only useful to verify the
-                        pipeline works).
+                        pipeline works). Chosen over PyTorch/ultralytics
+                        YOLO because official PyTorch has no wheels at all
+                        for this Pi's 32-bit ARM (armv7l) architecture.
 
 Design rule: detect() methods return DATA ONLY (tuples/lists), never draw
 or open windows. Drawing is a separate draw() method. This keeps detectors
@@ -186,21 +190,50 @@ class ColorMarkerDetector:
 
 
 class FishDetector:
-    """YOLO-based object detector.
+    """TensorFlow Lite object detector.
+
+    Replaced an earlier PyTorch/ultralytics YOLO version of this class:
+    official PyTorch publishes NO wheels at all for 32-bit ARM (armv7l --
+    this project's actual Pi architecture), at any version, on PyPI or
+    piwheels, so it could never be installed here. tflite-runtime does
+    publish an armv7l wheel, and TFLite is purpose-built for exactly this
+    kind of embedded inference besides -- expect tens of milliseconds per
+    frame on a Pi 4, not the ~1-3s/frame YOLO+torch would have cost even
+    if it could run at all.
 
     Notes
     -----
-    * `ultralytics` is imported inside __init__ on purpose: it is a heavy
-      dependency, and this way ball mode works even if it isn't installed.
-    * Stock yolov8n.pt is trained on COCO, which contains NO fish class.
-      Supply fish-trained weights (e.g. from Roboflow Universe) via
-      model_path for actual fish detection.
-    * Expect ~1-3 seconds per frame on a Pi 3. That is normal.
+    * `tflite_runtime` is imported inside __init__ on purpose, same
+      reasoning as the old ultralytics import: it's a real dependency,
+      and this way ball mode works even if it isn't installed.
+    * Unlike ultralytics' YOLO(), tflite-runtime has NO auto-download --
+      model_path must point at an actual .tflite file you already have.
+      A stock COCO-trained SSD model (e.g. the classic "detect.tflite" +
+      "labelmap.txt" pair from TensorFlow's object detection examples)
+      proves the pipeline runs but has NO fish class -- same caveat the
+      old stock yolov8n.pt had. Supply fish-trained weights, converted to
+      .tflite, for real fish detection.
+    * Assumes the model was exported WITH the standard TFLite detection
+      post-processing op baked in, i.e. its 4 output tensors are (in
+      order) [boxes, classes, scores, num_detections] with NMS already
+      applied -- true of virtually every prebuilt or edge-export TFLite
+      detection model. A custom export with a different output order
+      would need detect() below adjusted to match.
     """
 
-    def __init__(self, model_path="yolov8n.pt", conf=0.4):
-        from ultralytics import YOLO
-        self.model = YOLO(model_path)   # downloads weights on first ever run
+    def __init__(self, model_path, labels_path, conf=0.4):
+        from tflite_runtime.interpreter import Interpreter
+
+        self.interpreter = Interpreter(model_path=model_path)
+        self.interpreter.allocate_tensors()
+        self._input_details = self.interpreter.get_input_details()
+        self._output_details = self.interpreter.get_output_details()
+        _, self._input_h, self._input_w, _ = self._input_details[0]["shape"]
+        self._is_float_model = self._input_details[0]["dtype"] == np.float32
+
+        with open(labels_path) as f:
+            self.labels = [line.strip() for line in f if line.strip()]
+
         self.conf = conf                # minimum confidence to report
 
     def detect(self, frame):
@@ -208,22 +241,58 @@ class FishDetector:
 
         Returns
         -------
-        detections : list of (name, confidence, (x1, y1, x2, y2)) tuples.
-                     (x1, y1) = top-left corner, (x2, y2) = bottom-right.
-                     Empty list if nothing found.
-        raw        : the raw ultralytics result object (needed by draw()).
+        detections : list of (name, confidence, (x1, y1, x2, y2)) tuples,
+                     pixel coordinates already scaled to the ORIGINAL
+                     frame's size (the model itself only sees a resized
+                     copy). (x1, y1) = top-left corner, (x2, y2) =
+                     bottom-right. Empty list if nothing found.
+        raw        : always None -- kept only so this matches the
+                     (detections, raw) shape every other detector's
+                     detect() returns. Unlike ultralytics' Results
+                     object, TFLite's raw output tensors aren't useful to
+                     carry forward once decoded into `detections`.
         """
-        results = self.model(frame, conf=self.conf, verbose=False)
-        detections = []
-        for box in results[0].boxes:
-            name = self.model.names[int(box.cls)]          # class id -> word
-            xyxy = tuple(int(v) for v in box.xyxy[0])      # box corners
-            detections.append((name, float(box.conf), xyxy))
-        return detections, results[0]
+        frame_h, frame_w = frame.shape[:2]
+        resized = cv2.resize(frame, (self._input_w, self._input_h))
+        rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
+        input_data = np.expand_dims(rgb, axis=0)
+        if self._is_float_model:
+            # Quantized (uint8) models take raw 0-255 input as-is; float
+            # models expect it centered/scaled to roughly [-1, 1].
+            input_data = (np.float32(input_data) - 127.5) / 127.5
 
-    def draw(self, frame, raw):
-        """Return the frame annotated by YOLO (boxes + labels)."""
-        return raw.plot()
+        self.interpreter.set_tensor(self._input_details[0]["index"], input_data)
+        self.interpreter.invoke()
+
+        boxes = self.interpreter.get_tensor(self._output_details[0]["index"])[0]
+        classes = self.interpreter.get_tensor(self._output_details[1]["index"])[0]
+        scores = self.interpreter.get_tensor(self._output_details[2]["index"])[0]
+
+        detections = []
+        for box, cls, score in zip(boxes, classes, scores):
+            if score < self.conf:
+                continue
+            ymin, xmin, ymax, xmax = box    # normalized 0-1, model's own convention
+            xyxy = (
+                int(xmin * frame_w), int(ymin * frame_h),
+                int(xmax * frame_w), int(ymax * frame_h),
+            )
+            class_id = int(cls)
+            name = self.labels[class_id] if 0 <= class_id < len(self.labels) else str(class_id)
+            detections.append((name, float(score), xyxy))
+
+        return detections, None
+
+    def draw(self, frame, detections):
+        """Draw every detection's box + label onto frame IN PLACE (same
+        contract as RedBallDetector/ColorMarkerDetector's draw() -- unlike
+        the old ultralytics-backed version, which had to return a FRESH
+        image via raw.plot() instead). Returns the frame."""
+        for name, score, (x1, y1, x2, y2) in detections:
+            cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+            cv2.putText(frame, f"{name} {score:.2f}", (x1, max(0, y1 - 8)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+        return frame
 
     @staticmethod
     def center_of(detection):

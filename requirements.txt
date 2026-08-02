@@ -1,22 +1,27 @@
 # opencv-python is deliberately NOT listed here for pip to install.
-# On this Pi (Python 3.9), pip's source build fails patching OpenEXR --
-# there's no matching prebuilt wheel for this platform/Python combo.
-# Install it via apt instead, which ships a precompiled binary:
+# On this Pi (Python 3.9, armv7l), pip's source build fails patching
+# OpenEXR -- there's no matching prebuilt wheel for this platform/Python
+# combo. Install it via apt instead, which ships a precompiled binary:
 #     sudo apt install -y python3-opencv
 numpy
 requests
 
-# ultralytics (YOLO, used by Vision/detection.py's FishDetector) and its
-# own dependencies (torch, etc.) are deliberately NOT listed here either,
-# same reasoning as opencv-python above plus one more failure mode: pip's
-# resolver trying to satisfy ultralytics's pinned dependencies against
-# what's already installed can fall into backtracking through every past
-# ultralytics release one at a time looking for a combination that
-# resolves -- this can churn for a very long time instead of just failing
-# fast. See requirements-ml.txt (install with --no-deps) for that stack.
+# Fish detection runs on TensorFlow Lite, not PyTorch/ultralytics.
+# PyTorch was tried first and is a dead end on this hardware: official
+# PyTorch has never published wheels for 32-bit ARM (armv7l), at any
+# version, on PyPI or piwheels.
 #
-# torch/torchvision in particular usually need a Pi-specific wheel from
-# https://www.piwheels.org rather than plain PyPI -- if pip can't find a
-# wheel at all for this Pi's architecture/Python version, that's a piwheels
-# coverage gap, not a resolver problem, and needs a different fix (e.g. an
-# older torch release, or building from source).
+# tflite-runtime 2.14.0 does publish an official cp39-armv7l wheel on
+# PyPI, which is why it's pinned to that exact version here rather than
+# left open -- an unpinned version could resolve to a future release
+# without an armv7l wheel and send pip into the same backtracking search
+# that plain `ultralytics` triggered.
+#
+# One remaining risk, unconfirmed as of this file: that wheel's platform
+# tag is manylinux_2_34, which needs glibc >=2.34 (Debian Bookworm+). If
+# this Pi is still on Bullseye (glibc 2.31), pip will reject it as
+# incompatible even though the Python version/architecture match. If
+# that happens: either upgrade this Pi to Bookworm, or fall back to
+# onnxruntime (see github.com/nknytk/built-onnxruntime-for-raspberrypi-linux
+# for an armv7l-compatible build) instead of tflite-runtime.
+tflite-runtime==2.14.0
